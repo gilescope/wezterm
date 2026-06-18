@@ -31,8 +31,18 @@ const MATRIX_MAX: i32 = 12;
 /// Largest per-column head-start, as a fraction of the transition, so columns
 /// finish building at slightly different times.
 const PHASE_MAX: f32 = 0.25;
+/// Vertical gap (in cells) between the bottom of a column's matrix stream and
+/// the top of the still-falling outgoing text. Kept small so the dissolving and
+/// incoming screens flow into one another. Each column picks 1 or 2.
+fn bridge_for(c: usize) -> i32 {
+    1 + (hash3(c as u32, 5, 0) % 2) as i32
+}
 /// Rain quads sit on the top quad layer so they cover the pane's text.
 const LAYER: usize = 2;
+/// The effect's glyphs start this much larger than the cell and settle to 1.0×
+/// over `ZOOM_SETTLE` of the transition. 1.21 = two Ctrl+Plus steps (×1.1 each).
+const START_ZOOM: f32 = 1.21;
+const ZOOM_SETTLE: f32 = 0.35;
 /// Font family used for the falling stream glyphs. Its glyphs (the film's
 /// mirrored katakana) are mapped onto ASCII, so we feed it ASCII below. Falls
 /// back to the user's font if it isn't installed.
@@ -46,6 +56,9 @@ pub struct TabSwitchAnim {
     rows: usize,
     /// New screen graphemes, row-major (`row * cols + col`).
     cells: Vec<String>,
+    /// Outgoing screen graphemes, same layout. Empty when there was no
+    /// comparable previous screen (then the dissolve phase is skipped).
+    old_cells: Vec<String>,
     /// Deepest changed row per column; `-1` means the column is unchanged and
     /// is skipped entirely.
     depth: Vec<i32>,
@@ -109,8 +122,8 @@ impl crate::TermWindow {
         // dimensions we diff cell-by-cell; otherwise treat everything as changed.
         let mut depth = vec![-1i32; cols];
         let prev = prev_pane.as_ref().map(capture_screen);
-        match &prev {
-            Some((pc, pr, pcells)) if *pc == cols && *pr == rows => {
+        let old_cells = match prev {
+            Some((pc, pr, pcells)) if pc == cols && pr == rows => {
                 for c in 0..cols {
                     for r in 0..rows {
                         if pcells[r * cols + c] != cells[r * cols + c] {
@@ -118,14 +131,17 @@ impl crate::TermWindow {
                         }
                     }
                 }
+                pcells
             }
             _ => {
-                // No comparable previous screen: rebuild every column fully.
+                // No comparable previous screen: rebuild every column fully and
+                // skip the dissolve phase (no old grid to fall away).
                 for d in depth.iter_mut() {
                     *d = rows as i32 - 1;
                 }
+                Vec::new()
             }
-        }
+        };
 
         if depth.iter().all(|d| *d < 0) {
             // Identical screen: nothing to animate.
@@ -138,6 +154,7 @@ impl crate::TermWindow {
             cols,
             rows,
             cells,
+            old_cells,
             depth,
             // Real glyphs are shaped lazily, on demand, as cells resolve — so
             // we never pay for the whole screen up front (which could stall).
@@ -146,6 +163,24 @@ impl crate::TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+    }
+
+    /// Look up a real grapheme's glyph from the per-animation memo, shaping it
+    /// on first sight (subject to a per-frame budget). Returns `None` for
+    /// blanks, undrawable glyphs, or when the budget is spent this frame.
+    fn memo_glyph(&self, anim: &TabSwitchAnim, s: &str, budget: &mut i32) -> Option<GlyphInfo> {
+        if s.is_empty() || s == " " {
+            return None;
+        }
+        if !anim.glyphs.borrow().contains_key(s) {
+            if *budget <= 0 {
+                return None;
+            }
+            let shaped = self.shape_grapheme(s);
+            anim.glyphs.borrow_mut().insert(s.to_string(), shaped);
+            *budget -= 1;
+        }
+        anim.glyphs.borrow().get(s).and_then(|o| o.clone())
     }
 
     /// Shape a single grapheme to its leading glyph, or `None` if it has no
@@ -260,6 +295,7 @@ impl crate::TermWindow {
         col: usize,
         row_f: f32,
         color: LinearRgba,
+        zoom: f32,
         left_off: f32,
         top_off: f32,
     ) -> anyhow::Result<()> {
@@ -268,8 +304,10 @@ impl crate::TermWindow {
             Some(t) => t,
             None => return Ok(()),
         };
-        let gw = texture.coords.size.width as f32 * glyph.scale as f32;
-        let gh = texture.coords.size.height as f32 * glyph.scale as f32;
+        // `zoom` scales the glyph about its cell centre, so the effect can start
+        // a little larger and settle to the normal cell size.
+        let gw = texture.coords.size.width as f32 * glyph.scale as f32 * zoom;
+        let gh = texture.coords.size.height as f32 * glyph.scale as f32 * zoom;
         let gx = ox + col as f32 * cell_w + (cell_w - gw) / 2.0;
         let gy = oy + row_f * cell_h + (cell_h - gh) / 2.0;
         let mut quad = layers.allocate(LAYER)?;
@@ -353,60 +391,17 @@ impl crate::TermWindow {
         let top_off = self.dimensions.pixel_height as f32 / 2.0;
         let rows_i = rows as i32;
         let quantum = (elapsed / 60.0) as u32;
-
-        // Per-column build descriptor.
-        struct Col {
-            settle: f32,
-            front_row: i32,
-            gap: i32,
-            matrix: i32,
-            depth: i32,
-        }
-        let col_desc = |c: usize| -> Col {
-            let depth = anim.depth[c].min(rows_i - 1);
-            let span = (MATRIX_MAX - MATRIX_MIN + 1) as u32;
-            let matrix = MATRIX_MIN + (hash3(c as u32, 1, 0) % span) as i32;
-            let gap = 1 + (hash3(c as u32, 2, 0) % 2) as i32; // 1 or 2
-            let phase = (hash3(c as u32, 3, 0) % 1000) as f32 / 1000.0 * PHASE_MAX;
-            let fp = ((p - phase) / (1.0 - PHASE_MAX)).clamp(0.0, 1.0);
-            let fp = fp * fp * (3.0 - 2.0 * fp); // smoothstep
-            let build_rows = depth + 1; // only build down to the deepest change
-            let lead = (gap + matrix) as f32;
-            // Front starts above the top edge and ends past `build_rows`.
-            let settle = fp * (build_rows as f32 + lead) - lead;
-            Col {
-                settle,
-                front_row: settle.floor() as i32,
-                gap,
-                matrix,
-                depth,
-            }
+        // Start a touch larger and settle to the normal cell size. The ease
+        // finishes well before any row locks in, so the hand-off to the normal
+        // (1.0×) terminal render is seamless.
+        let zoom = {
+            let t = (p / ZOOM_SETTLE).clamp(0.0, 1.0);
+            let t = t * t * (3.0 - 2.0 * t);
+            START_ZOOM + (1.0 - START_ZOOM) * t
         };
 
-        // --- Pass A: black out the not-yet-built region of each column (only
-        // down to its deepest change). Background stays black; the green lives
-        // entirely in the glyphs.
-        let hide = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
-        for c in 0..cols {
-            let cd = col_desc(c);
-            if cd.depth < 0 {
-                continue; // unchanged column: leave the real content alone
-            }
-            let top = (cd.front_row + 1).max(0);
-            if top <= cd.depth {
-                let y0 = oy + top as f32 * cell_h;
-                let y1 = oy + (cd.depth + 1) as f32 * cell_h;
-                self.filled_rectangle(
-                    layers,
-                    LAYER,
-                    euclid::rect(ox + c as f32 * cell_w, y0, cell_w, y1 - y0),
-                    hide,
-                )?;
-            }
-        }
-
-        // --- Pass B: the leading matrix stream and the sliding real glyph.
-        // Real chars use the user's font; the stream uses the matrix font.
+        // Fonts shared by both phases: real chars in the user's font, the
+        // falling stream in the matrix font.
         let config = self.config.clone();
         let attrs = CellAttributes::default();
         let style = self.fonts.match_style(&config, &attrs).clone();
@@ -416,33 +411,84 @@ impl crate::TermWindow {
         let metrics = self.render_metrics.clone();
         let gl_state = self.render_state.as_ref().unwrap();
         let mut glyph_cache = gl_state.glyph_cache.borrow_mut();
-        // Cap new shaping per frame so a dense screen can never stall a frame;
-        // deferred graphemes simply shape on a later frame.
+        // Cap new shaping per frame so a dense screen can never stall a frame.
         let mut shape_budget = 96i32;
 
+        let hide = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
+        let has_old = !anim.old_cells.is_empty();
+
+        struct Col {
+            fall: f32,
+            settle: f32,
+            front_row: i32,
+            gap: i32,
+            matrix: i32,
+            depth: i32,
+        }
+        // One descending coordinate ties the dissolve and the build together.
+        // `fall` is the outgoing text's downward shift; the matrix stream sits
+        // just above it and the locked-in new text above that. So as the old
+        // text pours off the bottom, the new screen flows in right behind it
+        // with only a `bridge`-row gap — no big black band between them.
+        let col_desc = |c: usize| -> Col {
+            let depth = anim.depth[c].min(rows_i - 1);
+            let span = (MATRIX_MAX - MATRIX_MIN + 1) as u32;
+            let matrix = MATRIX_MIN + (hash3(c as u32, 1, 0) % span) as i32;
+            let gap = 1 + (hash3(c as u32, 2, 0) % 2) as i32; // new char ↔ stream
+            let bridge = bridge_for(c); // stream ↔ falling old text
+            let phase = (hash3(c as u32, 3, 0) % 1000) as f32 / 1000.0 * PHASE_MAX;
+            let fp = ((p - phase) / (1.0 - PHASE_MAX)).clamp(0.0, 1.0);
+            let fp = fp * fp * (3.0 - 2.0 * fp); // smoothstep
+            let total_lead = (gap + matrix + bridge) as f32;
+            // Both finish at fp == 1: old fully off the bottom, all rows built.
+            let fall = fp * (depth as f32 + 1.0 + total_lead);
+            let settle = fall - total_lead;
+            Col {
+                fall,
+                settle,
+                front_row: settle.floor() as i32,
+                gap,
+                matrix,
+                depth,
+            }
+        };
+
+        // One unified pass per column. Draw order within a column: black mask →
+        // falling old text → building new text, so the incoming build layers
+        // over the outgoing text where they meet.
         for c in 0..cols {
             let cd = col_desc(c);
             if cd.depth < 0 {
-                continue;
+                continue; // unchanged column: its text just stays put
             }
-            let r = cd.front_row + 1; // row currently locking in
 
-            // The real glyph slides down sub-cell, riding the fractional front.
-            // Skip while the front is still above the top edge (avoids bleeding
-            // a glyph up into the tab bar before row 0 has entered).
-            if r >= 0 && r <= cd.depth && cd.settle >= 0.0 {
-                let s = anim.cells[r as usize * anim.cols + c].clone();
-                if !s.is_empty() && s != " " {
-                    // Shape on first sight, then memoise (incl. the "no glyph"
-                    // outcome) so each grapheme is shaped at most once.
-                    if !anim.glyphs.borrow().contains_key(&s) && shape_budget > 0 {
-                        let shaped = self.shape_grapheme(&s);
-                        anim.glyphs.borrow_mut().insert(s.clone(), shaped);
-                        shape_budget -= 1;
+            // Mask the region below the build front (down to the deepest
+            // change). Above the front, the locked-in new text shows through.
+            let mask_top = (cd.front_row + 1).max(0);
+            if mask_top <= cd.depth {
+                let y0 = oy + mask_top as f32 * cell_h;
+                let y1 = oy + (cd.depth + 1) as f32 * cell_h;
+                self.filled_rectangle(
+                    layers,
+                    LAYER,
+                    euclid::rect(ox + c as f32 * cell_w, y0, cell_w, y1 - y0),
+                    hide,
+                )?;
+            }
+
+            // Falling old text: rides `bridge` rows below the matrix stream and
+            // pours off the bottom, so the outgoing screen flows straight into
+            // the incoming build above it.
+            if has_old {
+                for r in 0..=cd.depth {
+                    let yrow = r as f32 + cd.fall;
+                    if yrow > cd.depth as f32 + 0.999 {
+                        continue; // off the bottom of the changed region
                     }
-                    if let Some(info) = anim.glyphs.borrow().get(&s).and_then(|o| o.clone()) {
-                        // Bright white-green as it locks in.
-                        let color = LinearRgba::with_components(0.80, 1.0, 0.85, 1.0);
+                    let s = anim.old_cells[r as usize * anim.cols + c].clone();
+                    if let Some(info) = self.memo_glyph(anim, &s, &mut shape_budget) {
+                        let g = 0.40 + 0.55 * (yrow / (cd.depth as f32 + 1.0)).clamp(0.0, 1.0);
+                        let color = LinearRgba::with_components(0.0, g, 0.12 * g, 1.0);
                         self.emit_matrix_glyph(
                             layers,
                             &mut glyph_cache,
@@ -455,8 +501,9 @@ impl crate::TermWindow {
                             cell_w,
                             cell_h,
                             c,
-                            cd.settle, // fractional row → sub-cell slide
+                            yrow,
                             color,
+                            zoom,
                             left_off,
                             top_off,
                         )?;
@@ -464,8 +511,36 @@ impl crate::TermWindow {
                 }
             }
 
-            // Matrix stream: below the real char, separated by `gap` blanks.
-            // Bottom-most glyph leads and is the brightest head.
+            let r = cd.front_row + 1; // row currently locking in
+
+            // The new real glyph slides down sub-cell, riding the fractional
+            // front. Skip while the front is still above the top edge.
+            if r >= 0 && r <= cd.depth && cd.settle >= 0.0 {
+                let s = anim.cells[r as usize * anim.cols + c].clone();
+                if let Some(info) = self.memo_glyph(anim, &s, &mut shape_budget) {
+                    let color = LinearRgba::with_components(0.80, 1.0, 0.85, 1.0);
+                    self.emit_matrix_glyph(
+                        layers,
+                        &mut glyph_cache,
+                        &info,
+                        &style,
+                        &font,
+                        &metrics,
+                        ox,
+                        oy,
+                        cell_w,
+                        cell_h,
+                        c,
+                        cd.settle, // fractional row → sub-cell slide
+                        color,
+                        zoom,
+                        left_off,
+                        top_off,
+                    )?;
+                }
+            }
+
+            // Matrix stream: below the new char, separated by `gap` blanks.
             if !palette.is_empty() {
                 for j in 0..cd.matrix {
                     let row = r + cd.gap + 1 + j;
@@ -494,6 +569,7 @@ impl crate::TermWindow {
                         c,
                         row as f32,
                         color,
+                        zoom,
                         left_off,
                         top_off,
                     )?;

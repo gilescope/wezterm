@@ -1,5 +1,6 @@
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::render::RenderScreenLineParams;
+use crate::termwindow::{UIItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
 use config::{ConfigHandle, DimensionContext, TabBarPosition};
 use mux::renderable::RenderableDimensions;
@@ -37,6 +38,38 @@ impl crate::TermWindow {
             }
 
             self.ui_items.append(&mut self.paint_fancy_tab_bar()?);
+            // A vertical tab bar gets a thin draggable handle straddling its
+            // inner edge so the user can resize the bar width. Pushed last so
+            // it wins hit-testing (resolve_ui_item scans in reverse).
+            if self.is_tab_bar_vertical() {
+                let border = self.get_os_border();
+                let tab_bar_width = self.tab_bar_pixel_width();
+                const HANDLE: f32 = 6.0;
+                // The handle sits on the terminal side of the inner edge so it
+                // never overlaps tab content (notably the close button, which
+                // floats to the tab's inner edge on a Left bar).
+                let handle_x = match self.resolved_tab_bar_position() {
+                    TabBarPosition::Left => border.left.get() as f32 + tab_bar_width,
+                    // Right (and any other vertical position): terminal is to
+                    // the left of the bar, so the handle extends leftwards.
+                    _ => {
+                        self.dimensions.pixel_width as f32
+                            - border.right.get() as f32
+                            - tab_bar_width
+                            - HANDLE
+                    }
+                };
+                let height = (self.dimensions.pixel_height as f32
+                    - (border.top + border.bottom).get() as f32)
+                    .max(0.);
+                self.ui_items.push(UIItem {
+                    x: handle_x.max(0.) as usize,
+                    y: border.top.get() as usize,
+                    width: HANDLE as usize,
+                    height: height as usize,
+                    item_type: UIItemType::TabBarSeparator,
+                });
+            }
             return Ok(());
         }
 
@@ -160,6 +193,12 @@ impl crate::TermWindow {
     }
 
     pub fn tab_bar_pixel_width(&self) -> f32 {
+        // A drag-resized width takes precedence, but only while the bar is vertical.
+        if let Some(width) = self.tab_bar_width_override {
+            if self.config.resolved_tab_bar_position().is_vertical() {
+                return width;
+            }
+        }
         Self::tab_bar_pixel_width_impl(&self.config, &self.render_metrics, &self.dimensions)
     }
 }

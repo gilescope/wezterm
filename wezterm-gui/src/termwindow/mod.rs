@@ -159,6 +159,9 @@ pub enum UIItemType {
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
+    /// Draggable handle on the inner edge of a vertical (Left/Right) tab bar,
+    /// used to resize the tab bar width.
+    TabBarSeparator,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -391,6 +394,9 @@ pub struct TermWindow {
     show_scroll_bar: bool,
     tab_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
+    /// Runtime override for the vertical tab bar width, set by dragging the
+    /// separator. `None` falls back to `config.tab_bar_width`. Session-only.
+    tab_bar_width_override: Option<f32>,
     pub right_status: String,
     pub left_status: String,
     last_ui_item: Option<UIItem>,
@@ -729,6 +735,7 @@ impl TermWindow {
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
             fancy_tab_bar: None,
+            tab_bar_width_override: None,
             right_status: String::new(),
             left_status: String::new(),
             last_mouse_coords: (0, -1),
@@ -1976,6 +1983,23 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    /// If the mouse is hovering a tab in the tab bar, return that tab's title
+    /// for display in the OS window title. `None` when not hovering a tab.
+    fn hovered_tab_title(&self, tabs: &[TabInformation]) -> Option<String> {
+        // Only while the pointer is inside the window.
+        self.current_mouse_event.as_ref()?;
+        let tab_idx = match self.last_ui_item.as_ref()?.item_type {
+            UIItemType::TabBar(crate::tabbar::TabBarItem::Tab { tab_idx, .. }) => tab_idx,
+            _ => return None,
+        };
+        let info = tabs.iter().find(|t| t.tab_index == tab_idx)?;
+        if !info.tab_title.is_empty() {
+            Some(info.tab_title.clone())
+        } else {
+            info.active_pane.as_ref().map(|p| p.title.clone())
+        }
+    }
+
     fn update_title_impl(&mut self) {
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
@@ -2107,6 +2131,10 @@ impl TermWindow {
                 }
             }
         };
+
+        // While the mouse hovers over a tab, surface that tab's title in the OS
+        // window title; it reverts to `title` as soon as the pointer leaves.
+        let title = self.hovered_tab_title(&tabs).unwrap_or(title);
 
         if let Some(window) = self.window.as_ref() {
             window.set_title(&title);

@@ -43,6 +43,7 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
+            | UIItemType::TabBarSeparator
             | UIItemType::Split(_) => {}
         }
     }
@@ -54,6 +55,7 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
+            | UIItemType::TabBarSeparator
             | UIItemType::Split(_) => {}
         }
     }
@@ -415,6 +417,9 @@ impl super::TermWindow {
             UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => {
                 self.drag_reorder_tab(item, tab_idx, start_event, event);
             }
+            UIItemType::TabBarSeparator => {
+                self.drag_tab_bar_separator(item, event, context);
+            }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
             }
@@ -449,7 +454,61 @@ impl super::TermWindow {
             UIItemType::CloseTab(idx) => {
                 self.mouse_event_close_tab(idx, event, context);
             }
+            UIItemType::TabBarSeparator => {
+                self.mouse_event_tab_bar_separator(item, event, context);
+            }
         }
+    }
+
+    pub fn mouse_event_tab_bar_separator(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+        }
+    }
+
+    /// Resize the vertical tab bar by dragging its inner-edge separator.
+    /// Updates the runtime width override and re-lays-out the terminal area.
+    fn drag_tab_bar_separator(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let border = self.get_os_border();
+        let mouse_x = event.coords.x as f32;
+        let new_width = match self.resolved_tab_bar_position() {
+            config::TabBarPosition::Left => mouse_x - border.left.get() as f32,
+            config::TabBarPosition::Right => {
+                (self.dimensions.pixel_width as f32 - border.right.get() as f32) - mouse_x
+            }
+            // Horizontal bar: there is no width separator to drag.
+            _ => {
+                self.dragging.replace((item, event));
+                return;
+            }
+        };
+
+        // Clamp to a sane range: at least a few cells, at most 80% of the window.
+        let min_w = (self.render_metrics.cell_size.width as f32 * 4.).max(40.);
+        let max_w = self.dimensions.pixel_width as f32 * 0.8;
+        let new_width = new_width.clamp(min_w, max_w);
+
+        if (self.tab_bar_pixel_width() - new_width).abs() >= 1. {
+            self.tab_bar_width_override = Some(new_width);
+            self.invalidate_fancy_tab_bar();
+            if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
+                let dims = self.dimensions;
+                self.apply_dimensions(&dims, None, &window);
+            }
+            context.invalidate();
+        }
+        self.dragging.replace((item, event));
     }
 
     pub fn mouse_event_close_tab(

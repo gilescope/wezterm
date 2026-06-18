@@ -397,6 +397,10 @@ pub struct TermWindow {
     /// Runtime override for the vertical tab bar width, set by dragging the
     /// separator. `None` falls back to `config.tab_bar_width`. Session-only.
     tab_bar_width_override: Option<f32>,
+    /// Active matrix-rain tab-switch transition, if any.
+    tab_switch_anim: Option<crate::termwindow::render::matrix_rain::TabSwitchAnim>,
+    /// Lazily-shaped katakana/digit glyph palette for the matrix rain.
+    matrix_rain_palette: Option<Vec<wezterm_font::GlyphInfo>>,
     pub right_status: String,
     pub left_status: String,
     last_ui_item: Option<UIItem>,
@@ -736,6 +740,8 @@ impl TermWindow {
             tab_bar: TabBarState::default(),
             fancy_tab_bar: None,
             tab_bar_width_override: None,
+            tab_switch_anim: None,
+            matrix_rain_palette: None,
             right_status: String::new(),
             left_status: String::new(),
             last_mouse_coords: (0, -1),
@@ -2250,6 +2256,11 @@ impl TermWindow {
 
     fn activate_tab(&mut self, tab_idx: isize) -> anyhow::Result<()> {
         let mux = Mux::get();
+        // Capture the outgoing active pane BEFORE taking the window lock below:
+        // get_active_pane_or_overlay locks the mux itself, so calling it while
+        // holding get_window_mut would re-enter the lock and deadlock.
+        let prev_pane = self.get_active_pane_or_overlay();
+
         let mut window = mux
             .get_window_mut(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
@@ -2265,12 +2276,16 @@ impl TermWindow {
         };
 
         if tab_idx < max {
+            let changed = window.get_active_idx() != tab_idx;
             window.save_and_then_set_active(tab_idx);
 
             drop(window);
 
             if let Some(tab) = self.get_active_pane_or_overlay() {
                 tab.focus_changed(true);
+                if changed {
+                    self.start_matrix_rain(prev_pane, &tab);
+                }
             }
 
             self.update_title();

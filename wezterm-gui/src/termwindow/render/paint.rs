@@ -246,15 +246,27 @@ impl crate::TermWindow {
             .context("filled_rectangle for window background")?;
         }
 
-        for pos in panes {
+        for pos in &panes {
             if pos.is_active {
-                self.update_text_cursor(&pos);
+                self.update_text_cursor(pos);
                 if focused {
                     pos.pane.advise_focus();
                     mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
                 }
             }
-            self.paint_pane(&pos, &mut layers).context("paint_pane")?;
+            self.paint_pane(pos, &mut layers).context("paint_pane")?;
+        }
+
+        // Matrix-rain tab-switch transition over the freshly-activated pane.
+        if let Some(anim_pane) = self.matrix_rain_pane_id() {
+            if let Some(pos) = panes
+                .iter()
+                .find(|p| p.is_active && p.pane.pane_id() == anim_pane)
+            {
+                let (left, top, width, height) = (pos.left, pos.top, pos.width, pos.height);
+                self.paint_matrix_rain(&mut layers, left, top, width, height)
+                    .context("paint_matrix_rain")?;
+            }
         }
 
         if let Some(pane) = self.get_active_pane_or_overlay() {

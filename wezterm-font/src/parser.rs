@@ -865,6 +865,10 @@ pub(crate) fn load_built_in_fonts(font_info: &mut Vec<ParsedFont>) -> anyhow::Re
         &[font!("../../assets/fonts/NotoColorEmoji.ttf")],
         #[cfg(any(test, feature = "vendor-nerd-font-symbols"))]
         &[font!("../../assets/fonts/SymbolsNerdFontMono-Regular.ttf")],
+        // Always embedded: powers the matrix tab-switch transition's falling
+        // stream (family "Matrix Code NFI"). Tiny (~50KB) and needed regardless
+        // of the vendored-fonts feature, so it is not feature-gated.
+        &[font!("../../assets/fonts/matrix-code-nfi/MatrixCodeNFI.ttf")],
     ];
     for bundle in built_ins {
         for (data, name) in bundle.iter() {

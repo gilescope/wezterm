@@ -4,8 +4,6 @@ use crate::termwindow::TermWindowNotif;
 use config::configuration;
 use config::keyassignment::{InputSelector, InputSelectorEntry, KeyAssignment};
 use config::TabBarPosition;
-use wezterm_dynamic::FromDynamic;
-use window::WindowOps;
 use mux::termwiztermtab::TermWizTerminal;
 use mux_lua::MuxPane;
 use nucleo_matcher::pattern::Pattern;
@@ -19,6 +17,8 @@ use termwiz::input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseButtons, Mou
 use termwiz::surface::{Change, Position};
 use termwiz::terminal::Terminal;
 use termwiz_funcs::truncate_right;
+use wezterm_dynamic::FromDynamic;
+use window::WindowOps;
 
 const ROW_OVERHEAD: usize = 3;
 
@@ -212,22 +212,20 @@ impl SelectorState {
         // SetTabBarPosition is dispatched directly on the window; the chosen
         // position is carried in the selected entry's id (e.g. "Left").
         if matches!(*self.args.action, KeyAssignment::SetTabBarPosition(_)) {
-            if let Some(pos) = entry
-                .as_ref()
-                .and_then(|e| e.id.as_ref())
-                .and_then(|id| {
-                    TabBarPosition::from_dynamic(
-                        &wezterm_dynamic::Value::String(id.to_string()),
-                        Default::default(),
-                    )
-                    .ok()
-                })
-            {
-                self.window.window.notify(TermWindowNotif::PerformAssignment {
-                    pane_id: self.pane.0,
-                    assignment: KeyAssignment::SetTabBarPosition(pos),
-                    tx: None,
-                });
+            if let Some(pos) = entry.as_ref().and_then(|e| e.id.as_ref()).and_then(|id| {
+                TabBarPosition::from_dynamic(
+                    &wezterm_dynamic::Value::String(id.to_string()),
+                    Default::default(),
+                )
+                .ok()
+            }) {
+                self.window
+                    .window
+                    .notify(TermWindowNotif::PerformAssignment {
+                        pane_id: self.pane.0,
+                        assignment: KeyAssignment::SetTabBarPosition(pos),
+                        tx: None,
+                    });
             }
             return;
         }

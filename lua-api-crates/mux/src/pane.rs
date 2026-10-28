@@ -213,7 +213,10 @@ impl UserData for MuxPane {
         methods.add_method("get_program_status", |lua, this, _: ()| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;
-            lua.to_value(&pane.get_program_status())
+            match pane.get_program_status() {
+                Some(status) => lua.to_value(&status),
+                None => Ok(mlua::Value::Nil),
+            }
         });
 
         methods.add_method("is_alt_screen_active", |_, this, _: ()| {

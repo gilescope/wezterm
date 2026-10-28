@@ -305,7 +305,12 @@ impl UserData for PaneInformation {
         fields.add_field_method_get("pixel_height", |_, this| Ok(this.pixel_height));
         fields.add_field_method_get("progress", |lua, this| lua.to_value(&this.progress));
         fields.add_field_method_get("program_status", |lua, this| {
-            lua.to_value(&this.program_status)
+            // serde's None would become mlua's `null` userdata; Lua code
+            // wants a plain nil it can test with `if s then`.
+            match &this.program_status {
+                Some(status) => lua.to_value(status),
+                None => Ok(mlua::Value::Nil),
+            }
         });
         fields.add_field_method_get("has_unseen_command_result", |_, this| {
             Ok(this.has_unseen_command_result)
@@ -407,6 +412,9 @@ pub struct TermWindow {
     pub sub_tab_bar: TabBarState,
     pub fancy_sub_tab_bar: Option<box_model::ComputedElement>,
     pub show_sub_tab_bar: bool,
+    /// Set while rebuilding for a spinner frame: titles of unanimated tabs
+    /// and the window title are reused rather than recomputed through Lua.
+    animation_frame_rebuild: bool,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     /// `true` when the mux subscription must be unsubscribed from.
     /// This is done asynchronously to avoid races between mux events.
@@ -774,6 +782,7 @@ impl TermWindow {
             sub_tab_bar: TabBarState::default(),
             fancy_sub_tab_bar: None,
             show_sub_tab_bar: false,
+            animation_frame_rebuild: false,
             tab_bar_width_override: None,
             tab_switch_anim: None,
             matrix_rain_palette: None,
@@ -2055,6 +2064,14 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    /// Rebuild for the next spinner frame: 10 Hz while an agent is working,
+    /// so only the animated tabs go back through `format-tab-title`.
+    pub fn update_title_for_animation_frame(&mut self) {
+        self.animation_frame_rebuild = true;
+        self.update_title_impl();
+        self.animation_frame_rebuild = false;
+    }
+
     /// If the mouse is hovering a tab in the tab bar, return that tab's title
     /// for display in the OS window title. `None` when not hovering a tab.
     fn hovered_tab_title(&self, tabs: &[TabInformation]) -> Option<String> {
@@ -2170,6 +2187,7 @@ impl TermWindow {
             &self.config,
             &self.left_status,
             &self.right_status,
+            self.animation_frame_rebuild.then_some(&self.tab_bar),
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
@@ -2206,6 +2224,7 @@ impl TermWindow {
                 &self.config,
                 "",
                 "",
+                self.animation_frame_rebuild.then_some(&self.sub_tab_bar),
             )
         } else {
             TabBarState::default()
@@ -2223,6 +2242,13 @@ impl TermWindow {
             return;
         }
         drop(window);
+
+        // A spinner frame does not change the window title; skip the Lua
+        // round-trip (it serialises the whole Config) on those.
+        if self.animation_frame_rebuild {
+            self.schedule_next_status_update();
+            return;
+        }
 
         let title = match config::run_immediate_with_lua_config(|lua| {
             if let Some(lua) = lua {

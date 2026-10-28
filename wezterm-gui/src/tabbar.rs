@@ -22,6 +22,9 @@ pub struct TabBarState {
     /// at which the tab bar should be rebuilt to advance to the next frame;
     /// None when no spinner is visible.
     next_progress_frame_due: Option<Instant>,
+    /// First-pass (unhovered, full-width) title per tab id, so an animation
+    /// frame can rebuild without re-asking Lua for tabs that did not change.
+    titles: Vec<(usize, TitleText)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +45,7 @@ pub struct TabEntry {
     width: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct TitleText {
     items: Vec<FormatItem>,
     len: usize,
@@ -455,6 +458,7 @@ impl TabBarState {
                 width: 1,
             }],
             next_progress_frame_due: None,
+            titles: vec![],
         }
     }
 
@@ -570,6 +574,7 @@ impl TabBarState {
         config: &ConfigHandle,
         left_status: &str,
         right_status: &str,
+        reuse: Option<&TabBarState>,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
 
@@ -607,19 +612,48 @@ impl TabBarState {
         // are symbols representing minimize, maximize and close.
 
         let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar {
-            let requests: Vec<TitleRequest> = tab_info
+            // On an animation frame only the animated tabs can have changed;
+            // everything else keeps the title from the previous build.
+            let mut tab_titles: Vec<Option<TitleText>> = tab_info
+                .iter()
+                .map(|tab| {
+                    let reuse = reuse?;
+                    if tab.active_pane.as_ref().is_some_and(pane_is_animated) {
+                        return None;
+                    }
+                    reuse
+                        .titles
+                        .iter()
+                        .find(|(id, _)| *id == tab.tab_id)
+                        .map(|(_, title)| title.clone())
+                })
+                .collect();
+            let requests: Vec<TitleRequest> = tab_titles
                 .iter()
                 .enumerate()
-                .map(|(tab_idx, _tab)| TitleRequest {
+                .filter(|(_, t)| t.is_none())
+                .map(|(tab_idx, _)| TitleRequest {
                     tab_idx,
                     hover: false,
                     max_width: config.tab_max_width,
                 })
                 .collect();
-            compute_tab_titles(tab_info, pane_info, config, &requests)
+            let computed = compute_tab_titles(tab_info, pane_info, config, &requests);
+            for (req, title) in requests.iter().zip(computed) {
+                tab_titles[req.tab_idx] = Some(title);
+            }
+            tab_titles
+                .into_iter()
+                .map(|t| t.expect("every title filled"))
+                .collect()
         } else {
             vec![]
         };
+        let titles: Vec<(usize, TitleText)> = tab_info
+            .iter()
+            .map(|t| t.tab_id)
+            .zip(tab_titles.iter().cloned())
+            .collect();
         let titles_len: usize = tab_titles.iter().map(|s| s.len).sum();
         let number_of_tabs = tab_titles.len();
 
@@ -845,6 +879,7 @@ impl TabBarState {
             line,
             items,
             next_progress_frame_due: has_indeterminate_progress.then(next_spinner_frame_due),
+            titles,
         }
     }
 
@@ -1112,16 +1147,56 @@ mod tests {
 
     fn build(mouse_x: Option<usize>, n: usize) -> TabBarState {
         let (tab_info, pane_info) = tabs(n);
+        build_from(mouse_x, &tab_info, &pane_info, None)
+    }
+
+    fn build_from(
+        mouse_x: Option<usize>,
+        tab_info: &[TabInformation],
+        pane_info: &[PaneInformation],
+        reuse: Option<&TabBarState>,
+    ) -> TabBarState {
         TabBarState::new(
             200,
             mouse_x,
-            &tab_info,
-            &pane_info,
+            tab_info,
+            pane_info,
             None,
             &config::configuration(),
             "",
             "",
+            reuse,
         )
+    }
+
+    /// A spinner frame (10 Hz while an agent works) only re-asks Lua for
+    /// the animated tabs; the rest reuse the previous build's titles.
+    #[test]
+    fn animation_frame_reuses_unanimated_titles() {
+        config::use_this_lua_context_for_tests(install_counting_callback());
+        let (mut tab_info, pane_info) = tabs(5);
+        let working = ProgramStatus {
+            state: ProgramState::Working,
+            id: vec![],
+            kind: None,
+            progress: None,
+            app: Some("claude".into()),
+            title: None,
+            msg: None,
+        };
+        tab_info[2].active_pane.as_mut().unwrap().program_status = Some(working);
+
+        let first = build_from(None, &tab_info, &pane_info, None);
+        assert_eq!(calls(), 5);
+        assert!(first.next_progress_frame_due().is_some());
+
+        let frame = build_from(None, &tab_info, &pane_info, Some(&first));
+        assert_eq!(calls(), 6, "only the working tab was recomputed");
+        assert_eq!(frame.items().len(), first.items().len());
+
+        // A full rebuild still asks for everything.
+        build_from(None, &tab_info, &pane_info, None);
+        assert_eq!(calls(), 11);
     }
 
     /// One Lua round-trip per tab per rebuild. With 40 tabs the old
@@ -1141,6 +1216,34 @@ mod tests {
             n
         );
         assert_eq!(calls(), n);
+    }
+
+    /// An absent program status reaches Lua as nil, not serde's `null`
+    /// userdata, so `if pane.program_status then` works.
+    #[test]
+    fn absent_program_status_is_nil_in_lua() {
+        config::use_test_configuration();
+        let lua = config::lua::make_lua_context(Path::new("/nonexistent/wezterm.lua"))
+            .expect("lua context");
+        lua.load(
+            r#"
+            local wezterm = require 'wezterm'
+            wezterm.on('format-tab-title', function(tab)
+                return type(tab.active_pane.program_status)
+            end)
+            "#,
+        )
+        .exec()
+        .expect("register callback");
+        config::use_this_lua_context_for_tests(lua);
+
+        let state = build(None, 1);
+        let item = state
+            .items()
+            .iter()
+            .find(|i| matches!(i.item, TabBarItem::Tab { .. }))
+            .expect("tab present");
+        assert_eq!(item.title.as_str(), "nil");
     }
 
     /// Hovering recomputes only the hovered tab, so N+1 calls, not 2N.

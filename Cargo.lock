@@ -3610,10 +3610,12 @@ dependencies = [
  "textwrap",
  "thiserror 2.0.20",
  "url",
+ "varbincode",
  "wezterm-dynamic",
  "wezterm-ssh",
  "wezterm-term",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]

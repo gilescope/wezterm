@@ -134,7 +134,7 @@ impl crate::TermWindow {
                             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                                 tw.scheduled_animation.borrow_mut().take();
                                 if tw.tab_bar.next_progress_frame_due().is_some() {
-                                    tw.update_title_post_status();
+                                    tw.update_title_for_animation_frame();
                                 }
                                 win.invalidate();
                             })));

@@ -457,8 +457,10 @@ impl crate::TermWindow {
         computed.translate(euclid::vec2(translate_x, 0.));
 
         // More tabs than fit: slide the column (not the bar background) so
-        // the active tab is in view. Tabs pushed above the top just draw
-        // off-screen; the wheel and the keys walk through them.
+        // the active tab is in view. The offset persists between builds and
+        // moves only as far as needed, so selecting a tab that is already
+        // visible does not shift the list. Tabs pushed above the top just
+        // draw off-screen; the wheel and the keys walk through them.
         let avail = self.dimensions.pixel_height as f32 - (border.top + border.bottom).get() as f32;
         let ui_items = computed.ui_items();
         let bottom_of = |item: &UIItem| (item.y + item.height) as f32;
@@ -477,22 +479,35 @@ impl crate::TermWindow {
             .find(|item| matches!(item.item_type, UIItemType::TabBar(TabBarItem::NewTabButton)));
         // Keep the active tab in view; when it is the last one, keep the `+`
         // below it in view too, so the end of the list always offers a new tab.
-        let active_bottom = active.map(|a| {
+        let margin = metrics.cell_size.height as f32 * 0.5;
+        let total = ui_items
+            .iter()
+            .filter(|item| matches!(item.item_type, UIItemType::TabBar(_)))
+            .map(|item| bottom_of(item))
+            .fold(0f32, f32::max)
+            + margin;
+        let max_offset = (total - avail).max(0.);
+        let mut offset = self.tab_bar_scroll_offset.get().clamp(0., max_offset);
+        if let Some(a) = active {
+            let top = a.y as f32 - margin;
             let mut bottom = bottom_of(a);
             if last_tab.is_some_and(|l| l.y == a.y) {
                 if let Some(plus) = new_tab {
                     bottom = bottom.max(bottom_of(plus));
                 }
             }
-            bottom + metrics.cell_size.height as f32 * 0.5
-        });
-        if let Some(bottom) = active_bottom {
-            let overflow = bottom - avail;
-            if overflow > 0. {
-                if let ComputedElementContent::Children(kids) = &mut computed.content {
-                    for kid in kids {
-                        kid.translate(euclid::vec2(0., -overflow));
-                    }
+            let bottom = bottom + margin;
+            if bottom - offset > avail {
+                offset = (bottom - avail).clamp(0., max_offset);
+            } else if top - offset < 0. {
+                offset = top.clamp(0., max_offset);
+            }
+        }
+        self.tab_bar_scroll_offset.set(offset);
+        if offset > 0. {
+            if let ComputedElementContent::Children(kids) = &mut computed.content {
+                for kid in kids {
+                    kid.translate(euclid::vec2(0., -offset));
                 }
             }
         }

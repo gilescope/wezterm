@@ -415,6 +415,9 @@ pub struct TermWindow {
     /// Set while rebuilding for a spinner frame: titles of unanimated tabs
     /// and the window title are reused rather than recomputed through Lua.
     animation_frame_rebuild: bool,
+    /// How far the vertical tab bar's column is scrolled, in pixels; kept
+    /// across rebuilds so the list only moves when the active tab leaves view.
+    pub tab_bar_scroll_offset: std::cell::Cell<f32>,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     /// `true` when the mux subscription must be unsubscribed from.
     /// This is done asynchronously to avoid races between mux events.
@@ -783,6 +786,7 @@ impl TermWindow {
             fancy_sub_tab_bar: None,
             show_sub_tab_bar: false,
             animation_frame_rebuild: false,
+            tab_bar_scroll_offset: std::cell::Cell::new(0.),
             tab_bar_width_override: None,
             tab_switch_anim: None,
             matrix_rain_palette: None,

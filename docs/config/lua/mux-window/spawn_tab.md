@@ -56,4 +56,16 @@ defined in your configuration using the following:
 window:spawn_tab { domain = { DomainName = 'my.name' } }
 ```
 
+### parent_tab_id
+
+{{since('nightly')}}
+
+Nests the new tab under the root tab with this id (from `tab:tab_id()`); see
+[SpawnChildTab](../keyassignment/SpawnChildTab.md).
+
+```lua
+local root = window:active_tab()
+window:spawn_tab { parent_tab_id = root:tab_id() }
+```
+
 

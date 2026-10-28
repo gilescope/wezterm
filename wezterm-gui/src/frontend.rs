@@ -87,6 +87,7 @@ impl GuiFrontEnd {
                     .detach();
                 }
                 MuxNotification::TabTitleChanged { .. } => {}
+                MuxNotification::TabParentChanged { .. } => {}
                 MuxNotification::WindowTitleChanged { .. } => {}
                 MuxNotification::TabResized(_) => {}
                 MuxNotification::TabAddedToWindow { .. } => {}

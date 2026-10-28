@@ -222,11 +222,14 @@ pub struct TabInformation {
     pub active_pane: Option<PaneInformation>,
     pub window_id: MuxWindowId,
     pub tab_title: String,
+    /// Root tab this one nests under, if any.
+    pub parent_tab_id: Option<TabId>,
 }
 
 impl UserData for TabInformation {
     fn add_fields<'lua, F: UserDataFields<'lua, Self>>(fields: &mut F) {
         fields.add_field_method_get("tab_id", |_, this| Ok(this.tab_id));
+        fields.add_field_method_get("parent_tab_id", |_, this| Ok(this.parent_tab_id));
         fields.add_field_method_get("tab_index", |_, this| Ok(this.tab_index));
         fields.add_field_method_get("is_active", |_, this| Ok(this.is_active));
         fields.add_field_method_get("is_last_active", |_, this| Ok(this.is_last_active));
@@ -399,6 +402,11 @@ pub struct TermWindow {
     /// Terminal dimensions
     terminal_size: TerminalSize,
     pub mux_window_id: MuxWindowId,
+    /// With a vertical tab bar: the top row holding the active root tab
+    /// and its children, shown only when it has children.
+    pub sub_tab_bar: TabBarState,
+    pub fancy_sub_tab_bar: Option<box_model::ComputedElement>,
+    pub show_sub_tab_bar: bool,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     /// `true` when the mux subscription must be unsubscribed from.
     /// This is done asynchronously to avoid races between mux events.
@@ -763,6 +771,9 @@ impl TermWindow {
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
             fancy_tab_bar: None,
+            sub_tab_bar: TabBarState::default(),
+            fancy_sub_tab_bar: None,
+            show_sub_tab_bar: false,
             tab_bar_width_override: None,
             tab_switch_anim: None,
             matrix_rain_palette: None,
@@ -1371,7 +1382,8 @@ impl TermWindow {
                     // Also handled by wezterm-client
                     self.update_title_post_status();
                 }
-                MuxNotification::TabTitleChanged { .. } => {
+                MuxNotification::TabTitleChanged { .. }
+                | MuxNotification::TabParentChanged { .. } => {
                     self.update_title_post_status();
                 }
                 MuxNotification::PaneAdded(_)
@@ -1570,7 +1582,8 @@ impl TermWindow {
                 return true;
             }
             MuxNotification::TabResized(tab_id)
-            | MuxNotification::TabTitleChanged { tab_id, .. } => {
+            | MuxNotification::TabTitleChanged { tab_id, .. }
+            | MuxNotification::TabParentChanged { tab_id, .. } => {
                 let mux = Mux::get();
                 if mux.window_containing_tab(tab_id) == Some(mux_window_id) {
                     // fall through
@@ -2075,6 +2088,41 @@ impl TermWindow {
         let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
         let tab_bar_width = self.tab_bar_pixel_width();
 
+        // A vertical bar lists root tabs; the active root's children (plus
+        // the root itself) go in a top row instead. Side-bar entries keep
+        // their mux index so clicks still resolve; the active root is the
+        // one whose block holds the active tab.
+        let (bar_tabs, row_tabs): (Vec<TabInformation>, Vec<TabInformation>) =
+            if tab_pos.is_vertical() && !tabs.is_empty() {
+                let active_idx = tabs.iter().position(|t| t.is_active).unwrap_or(0);
+                let root = window.root_idx_of(active_idx);
+                let block = root..window.children_of(root).end;
+                let row = if block.len() > 1 {
+                    tabs[block.clone()].to_vec()
+                } else {
+                    vec![]
+                };
+                let roots = window
+                    .root_indices()
+                    .into_iter()
+                    .map(|i| {
+                        let mut t = tabs[i].clone();
+                        t.is_active = i == root;
+                        t
+                    })
+                    .collect();
+                (roots, row)
+            } else {
+                (tabs.clone(), vec![])
+            };
+        let show_sub_tab_bar = !row_tabs.is_empty();
+        if show_sub_tab_bar != self.show_sub_tab_bar {
+            self.show_sub_tab_bar = show_sub_tab_bar;
+            // The row takes pane space, so relayout like a tab-bar show/hide.
+            self.show_tab_bar_changed();
+        }
+        let left_bar_width = self.left_bar_width();
+
         let hovering_in_tab_bar = match &self.current_mouse_event {
             Some(event) => {
                 if tab_pos.is_vertical() {
@@ -2102,10 +2150,11 @@ impl TermWindow {
             None => false,
         };
 
+        let cell_width = self.render_metrics.cell_size.width as usize;
         let tab_bar_cols = if tab_pos.is_vertical() {
-            (tab_bar_width as usize) / self.render_metrics.cell_size.width as usize
+            (tab_bar_width as usize) / cell_width
         } else {
-            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize
+            self.dimensions.pixel_width / cell_width
         };
 
         let new_tab_bar = TabBarState::new(
@@ -2115,7 +2164,7 @@ impl TermWindow {
             } else {
                 None
             },
-            &tabs,
+            &bar_tabs,
             &panes,
             self.config.resolved_palette.tab_bar.as_ref(),
             &self.config,
@@ -2126,6 +2175,44 @@ impl TermWindow {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
             self.invalidate_modal();
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+
+        // The top row sits right of the side bar; hover x is in its own cells.
+        let row_x0 = border.left.get() as f32 + left_bar_width;
+        let row_width = (self.dimensions.pixel_width as f32
+            - left_bar_width
+            - (border.left + border.right).get() as f32)
+            .max(0.);
+        let hovering_in_row = show_sub_tab_bar
+            && self.current_mouse_event.as_ref().is_some_and(|event| {
+                let (x, y) = (event.coords.x as f32, event.coords.y as f32);
+                let y0 = border.top.get() as f32;
+                x >= row_x0 && x < row_x0 + row_width && y >= y0 && y < y0 + tab_bar_height
+            });
+        let new_sub_tab_bar = if show_sub_tab_bar {
+            TabBarState::new(
+                row_width as usize / cell_width,
+                hovering_in_row.then(|| {
+                    self.last_mouse_coords
+                        .0
+                        .saturating_sub(row_x0 as usize / cell_width)
+                }),
+                &row_tabs,
+                &panes,
+                self.config.resolved_palette.tab_bar.as_ref(),
+                &self.config,
+                "",
+                "",
+            )
+        } else {
+            TabBarState::default()
+        };
+        if new_sub_tab_bar != self.sub_tab_bar {
+            self.sub_tab_bar = new_sub_tab_bar;
+            self.invalidate_fancy_tab_bar();
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
             }
@@ -2209,10 +2296,17 @@ impl TermWindow {
             // to piggy back on the config reloading code for that, so that
             // is what we're doing.
             if show_tab_bar != self.show_tab_bar {
-                self.config_was_reloaded();
+                self.show_tab_bar_changed();
             }
         }
         self.schedule_next_status_update();
+    }
+
+    /// Relayout after a bar appeared or disappeared. Piggybacks on the
+    /// config-reload path, which already resizes everything for a new bar
+    /// geometry.
+    fn show_tab_bar_changed(&mut self) {
+        self.config_was_reloaded();
     }
 
     fn schedule_next_status_update(&mut self) {
@@ -2237,17 +2331,8 @@ impl TermWindow {
         if let Some(win) = self.window.as_ref() {
             let cursor = pos.pane.get_cursor_position();
             let top = pos.pane.get_dimensions().physical_top;
-            let tab_pos = self.resolved_tab_bar_position();
-            let tab_bar_height = if self.show_tab_bar && tab_pos == config::TabBarPosition::Top {
-                self.tab_bar_pixel_height().unwrap()
-            } else {
-                0.0
-            };
-            let left_bar_width = if self.show_tab_bar && tab_pos == config::TabBarPosition::Left {
-                self.tab_bar_pixel_width()
-            } else {
-                0.0
-            };
+            let (tab_bar_height, _) = self.horizontal_bar_heights();
+            let left_bar_width = self.left_bar_width();
             let (padding_left, padding_top) = self.padding_left_top();
 
             let r = Rect::new(
@@ -2403,15 +2488,34 @@ impl TermWindow {
 
         ensure!(tab_idx < max, "cannot move a tab out of range");
 
-        let tab = window.remove_tab_idx(active_tab_idx);
-        window.insert_tab_at_idx(tab_idx, &tab);
-        window.set_active_tab_idx_without_saving(tab_idx);
+        // A root carries its children and steps over whole blocks; a child
+        // stays within its block. The window keeps the active tab active.
+        let delta = tab_idx as isize - active_tab_idx as isize;
+        if window.move_tab_relative(active_tab_idx, delta).is_none() {
+            return Ok(());
+        }
 
         drop(window);
         self.update_title();
         self.update_scrollbar();
 
         Ok(())
+    }
+
+    /// Cycle through root tabs only, wrapping at either end.
+    fn activate_root_relative(&mut self, delta: isize) -> anyhow::Result<()> {
+        let mux = Mux::get();
+        let window = mux
+            .get_window(self.mux_window_id)
+            .ok_or_else(|| anyhow!("no such window"))?;
+        let roots = window.root_indices();
+        ensure!(!roots.is_empty(), "no more tabs");
+        let active_root = window.root_idx_of(window.get_active_tab_idx());
+        let r = roots.iter().position(|&i| i == active_root).unwrap_or(0) as isize;
+        let n = roots.len() as isize;
+        let target = roots[((r + delta) % n + n) as usize % roots.len()];
+        drop(window);
+        self.activate_tab(target as isize)
     }
 
     fn show_input_selector(&mut self, args: &config::keyassignment::InputSelector) {
@@ -2840,6 +2944,12 @@ impl TermWindow {
             }
             SpawnTab(spawn_where) => {
                 self.spawn_tab(spawn_where);
+            }
+            SpawnChildTab(spawn_where) => {
+                self.spawn_child_tab(spawn_where);
+            }
+            ActivateRootRelative(n) => {
+                self.activate_root_relative(*n)?;
             }
             SpawnWindow => {
                 self.spawn_command(&SpawnCommand::default(), SpawnWhere::NewWindow);
@@ -3684,6 +3794,7 @@ impl TermWindow {
                         .unwrap_or(false),
                     window_id: self.mux_window_id,
                     tab_title: tab.get_title(),
+                    parent_tab_id: tab.get_parent(),
                     active_pane: panes
                         .iter()
                         .find(|p| p.is_active)

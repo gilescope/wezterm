@@ -44,6 +44,14 @@ impl crate::TermWindow {
             }
 
             self.ui_items.append(&mut self.paint_fancy_tab_bar()?);
+            if self.is_tab_bar_vertical() && self.show_sub_tab_bar {
+                if self.fancy_sub_tab_bar.is_none() {
+                    let palette = self.palette().clone();
+                    let row = self.build_fancy_sub_tab_bar(&palette)?;
+                    self.fancy_sub_tab_bar.replace(row);
+                }
+                self.ui_items.append(&mut self.paint_fancy_sub_tab_bar()?);
+            }
             // A vertical tab bar gets a thin draggable handle straddling its
             // inner edge so the user can resize the bar width. Pushed last so
             // it wins hit-testing (resolve_ui_item scans in reverse).
@@ -177,6 +185,30 @@ impl crate::TermWindow {
 
     pub fn tab_bar_pixel_height(&self) -> anyhow::Result<f32> {
         Self::tab_bar_pixel_height_impl(&self.config, &self.fonts, &self.render_metrics)
+    }
+
+    /// Pixel heights of the horizontal bars above and below the panes: the
+    /// tab bar when it is at the Top/Bottom, or the child-tab row that a
+    /// vertical bar shows above the panes when the active root has children.
+    pub fn horizontal_bar_heights(&self) -> (f32, f32) {
+        if !self.show_tab_bar {
+            return (0., 0.);
+        }
+        let h = self.tab_bar_pixel_height().unwrap_or(0.);
+        match self.resolved_tab_bar_position() {
+            TabBarPosition::Top => (h, 0.),
+            TabBarPosition::Bottom => (0., h),
+            _ => (if self.show_sub_tab_bar { h } else { 0. }, 0.),
+        }
+    }
+
+    /// Pixel width of the bar on the left of the panes (0 unless Left).
+    pub fn left_bar_width(&self) -> f32 {
+        if self.show_tab_bar && self.resolved_tab_bar_position() == TabBarPosition::Left {
+            self.tab_bar_pixel_width()
+        } else {
+            0.
+        }
     }
 
     /// Returns the pixel width of the tab bar when positioned vertically (Left/Right).

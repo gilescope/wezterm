@@ -46,6 +46,9 @@ struct TabInner {
     zoomed: Option<Arc<dyn Pane>>,
     title: String,
     recency: Recency,
+    /// Root tab this one nests under in the window's tab bar (the "top
+    /// row" of a side bar). `None` for a root tab.
+    parent: Option<TabId>,
 }
 
 /// A Tab is a container of Panes
@@ -520,6 +523,25 @@ impl Tab {
         self.inner.lock().title.clone()
     }
 
+    pub fn get_parent(&self) -> Option<TabId> {
+        self.inner.lock().parent
+    }
+
+    /// Set (or clear) the root this tab nests under. Ordering within the
+    /// window is the window's job: see `Window::attach_tab_to_parent`.
+    pub fn set_parent(&self, parent: Option<TabId>) {
+        let mut inner = self.inner.lock();
+        if inner.parent != parent {
+            inner.parent = parent;
+            Mux::try_get().map(|mux| {
+                mux.notify(MuxNotification::TabParentChanged {
+                    tab_id: inner.id,
+                    parent,
+                })
+            });
+        }
+    }
+
     pub fn set_title(&self, title: &str) {
         let mut inner = self.inner.lock();
         if inner.title != title {
@@ -764,6 +786,7 @@ impl TabInner {
             zoomed: None,
             title: String::new(),
             recency: Recency::default(),
+            parent: None,
         }
     }
 

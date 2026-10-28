@@ -606,21 +606,14 @@ impl TabBarState {
         // menu with tab creation options) and the other three chars
         // are symbols representing minimize, maximize and close.
 
-        let mut active_tab_no = 0;
-
         let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar {
             let requests: Vec<TitleRequest> = tab_info
                 .iter()
                 .enumerate()
-                .map(|(tab_idx, tab)| {
-                    if tab.is_active {
-                        active_tab_no = tab.tab_index;
-                    }
-                    TitleRequest {
-                        tab_idx,
-                        hover: false,
-                        max_width: config.tab_max_width,
-                    }
+                .map(|(tab_idx, _tab)| TitleRequest {
+                    tab_idx,
+                    hover: false,
+                    max_width: config.tab_max_width,
                 })
                 .collect();
             compute_tab_titles(tab_info, pane_info, config, &requests)
@@ -686,7 +679,10 @@ impl TabBarState {
 
         for (tab_idx, tab_title) in tab_titles.iter().enumerate() {
             let tab_title_len = tab_title.len.min(tab_width_max);
-            let active = tab_idx == active_tab_no;
+            // `tab_info` may be a subset of the window's tabs (a side bar
+            // lists roots only), so the item carries the mux index.
+            let info = &tab_info[tab_idx];
+            let active = info.is_active;
             let hover = !active && is_tab_hover(mouse_x, x, tab_title_len);
 
             // The first pass already asked for this title unhovered with the
@@ -735,7 +731,10 @@ impl TabBarState {
             let width = tab_line.len();
 
             items.push(TabEntry {
-                item: TabBarItem::Tab { tab_idx, active },
+                item: TabBarItem::Tab {
+                    tab_idx: info.tab_index,
+                    active,
+                },
                 title,
                 x: tab_start_idx,
                 width,
@@ -1021,6 +1020,7 @@ mod tests {
             active_pane: Some(pane),
             window_id: 0,
             tab_title: String::new(),
+            parent_tab_id: None,
         };
         builtin_tab_title(&tab, &config::configuration())
     }
@@ -1074,6 +1074,7 @@ mod tests {
                 active_pane: Some(pane(i)),
                 window_id: 0,
                 tab_title: format!("tab{i}"),
+                parent_tab_id: None,
             })
             .collect();
         (tabs, (0..n).map(pane).collect())

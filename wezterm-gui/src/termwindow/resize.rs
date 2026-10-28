@@ -163,10 +163,9 @@ impl super::TermWindow {
 
         let config = &self.config;
 
-        let tab_bar_height = if self.show_tab_bar && !self.is_tab_bar_vertical() {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
+        let tab_bar_height = {
+            let (top, bottom) = self.horizontal_bar_heights();
+            top + bottom
         };
         let tab_bar_width = if self.show_tab_bar {
             self.tab_bar_pixel_width()
@@ -501,7 +500,7 @@ impl super::TermWindow {
 
         let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
         let is_vertical = config.resolved_tab_bar_position().is_vertical();
-        let tab_bar_height = if show_tab_bar && !is_vertical {
+        let tab_bar_height = if show_tab_bar && (!is_vertical || self.show_sub_tab_bar) {
             self.tab_bar_pixel_height()? as usize
         } else {
             0

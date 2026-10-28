@@ -46,6 +46,34 @@ impl UserData for MuxTab {
             let tab = this.resolve(&mux)?;
             Ok(tab.set_title(&title))
         });
+        methods.add_method("get_parent", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let tab = this.resolve(&mux)?;
+            Ok(tab.get_parent().map(MuxTab))
+        });
+        // Takes the parent's tab id (`tab:tab_id()`), or nil to make it a root.
+        methods.add_method("set_parent", |_, this, parent: Option<TabId>| {
+            let mux = get_mux()?;
+            match parent {
+                Some(parent) => {
+                    let mut moved = false;
+                    for window_id in mux.iter_windows() {
+                        if let Some(mut window) = mux.get_window_mut(window_id) {
+                            if window.attach_tab_to_parent(this.0, parent).is_some() {
+                                moved = true;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(moved)
+                }
+                None => {
+                    let tab = this.resolve(&mux)?;
+                    tab.set_parent(None);
+                    Ok(true)
+                }
+            }
+        });
         methods.add_method("active_pane", |_, this, _: ()| {
             let mux = get_mux()?;
             let tab = this.resolve(&mux)?;

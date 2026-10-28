@@ -27,6 +27,11 @@ As features stabilize some brief notes about them will accumulate here.
   done or failed; see [pane:get_program_status()](config/lua/pane/get_program_status.md).
   OSC 133 `D` now feeds [pane:has_unseen_command_result()](config/lua/pane/has_unseen_command_result.md),
   a finished-command signal that prompt redraws do not trip.
+* Nested tabs: [SpawnChildTab](config/lua/keyassignment/SpawnChildTab.md)
+  opens a tab under the current tab's root. With a Left/Right tab bar the
+  side bar lists roots and the active root's children appear in a row across
+  the top. Also [ActivateRootRelative](config/lua/keyassignment/ActivateRootRelative.md),
+  `window:spawn_tab{parent_tab_id=}`, `tab:get_parent()`, `tab:set_parent()`.
 * Tab bar rebuilds are much cheaper with many tabs: `format-tab-title` runs
   once per tab per rebuild, and unchanged OSC 0/2/7 reports no longer rebuild it.
 * fonts: Default dim/bold text now looks more contrasting, see #8049 for examples.

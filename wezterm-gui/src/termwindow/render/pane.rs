@@ -62,27 +62,8 @@ impl crate::TermWindow {
 
         let (padding_left, padding_top) = self.padding_left_top();
 
-        let tab_pos = self.resolved_tab_bar_position();
-        let tab_bar_height = if self.show_tab_bar && !tab_pos.is_vertical() {
-            self.tab_bar_pixel_height()
-                .context("tab_bar_pixel_height")?
-        } else {
-            0.
-        };
-        let tab_bar_width = if self.show_tab_bar {
-            self.tab_bar_pixel_width()
-        } else {
-            0.
-        };
-        let (top_bar_height, bottom_bar_height) = match tab_pos {
-            config::TabBarPosition::Bottom => (0.0, tab_bar_height),
-            config::TabBarPosition::Top => (tab_bar_height, 0.0),
-            _ => (0.0, 0.0),
-        };
-        let left_bar_width = match tab_pos {
-            config::TabBarPosition::Left => tab_bar_width,
-            _ => 0.0,
-        };
+        let (top_bar_height, bottom_bar_height) = self.horizontal_bar_heights();
+        let left_bar_width = self.left_bar_width();
 
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
@@ -599,26 +580,8 @@ impl crate::TermWindow {
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
         let (padding_left, padding_top) = self.padding_left_top();
-        let bp = self.resolved_tab_bar_position();
-        let tab_bar_height = if self.show_tab_bar && !bp.is_vertical() {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.
-        };
-        let tab_bar_width = if self.show_tab_bar {
-            self.tab_bar_pixel_width()
-        } else {
-            0.
-        };
-        let (top_bar_height, _bottom_bar_height) = match bp {
-            config::TabBarPosition::Bottom => (0.0, tab_bar_height),
-            config::TabBarPosition::Top => (tab_bar_height, 0.0),
-            _ => (0.0, 0.0),
-        };
-        let left_bar_width2 = match bp {
-            config::TabBarPosition::Left => tab_bar_width,
-            _ => 0.0,
-        };
+        let (top_bar_height, _bottom_bar_height) = self.horizontal_bar_heights();
+        let left_bar_width2 = self.left_bar_width();
 
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;

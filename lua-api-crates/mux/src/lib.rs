@@ -270,6 +270,9 @@ struct SpawnTab {
     domain: SpawnTabDomain,
     #[dynamic(flatten)]
     cmd_builder: CommandBuilderFrag,
+    /// Nest the new tab under this root tab (its id).
+    #[dynamic(default)]
+    parent_tab_id: Option<TabId>,
 }
 impl_lua_conversion_dynamic!(SpawnTab);
 
@@ -306,6 +309,12 @@ impl SpawnTab {
             )
             .await
             .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;
+
+        if let Some(parent) = self.parent_tab_id {
+            if let Some(mut window) = mux.get_window_mut(window_id) {
+                window.attach_tab_to_parent(tab.tab_id(), parent);
+            }
+        }
 
         Ok((
             MuxTab(tab.tab_id()),

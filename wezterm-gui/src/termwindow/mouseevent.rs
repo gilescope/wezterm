@@ -319,17 +319,7 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
-        let scroll_tab_pos = self.resolved_tab_bar_position();
-        let tab_bar_height = if self.show_tab_bar && !scroll_tab_pos.is_vertical() {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
-        };
-        let (top_bar_height, bottom_bar_height) = match scroll_tab_pos {
-            config::TabBarPosition::Bottom => (0.0, tab_bar_height),
-            config::TabBarPosition::Top => (tab_bar_height, 0.0),
-            _ => (0.0, 0.0),
-        };
+        let (top_bar_height, bottom_bar_height) = self.horizontal_bar_heights();
 
         let border = self.get_os_border();
         let y_offset = top_bar_height + border.top.get() as f32;
@@ -357,11 +347,26 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
-    fn find_tab_item_by_idx(&mut self, target_tab_idx: TabId) -> Option<&UIItem> {
+    /// A root tab appears in both the side bar and the child row, so the
+    /// lookup is restricted to the bar the drag started in.
+    fn find_tab_item_by_idx(&mut self, target_tab_idx: TabId, in_row: bool) -> Option<&UIItem> {
+        let row_bottom = self.row_bottom();
         self.ui_items.iter().find(|item| match item.item_type {
-            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => tab_idx == target_tab_idx,
+            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => {
+                tab_idx == target_tab_idx && (item.y < row_bottom) == in_row
+            }
             _ => false,
         })
+    }
+
+    /// Pixel y below which a tab-bar ui item belongs to the child row.
+    fn row_bottom(&self) -> usize {
+        if self.is_tab_bar_vertical() && self.show_sub_tab_bar {
+            let (top, _) = self.horizontal_bar_heights();
+            (self.get_os_border().top.get() as f32 + top) as usize
+        } else {
+            0
+        }
     }
 
     fn drag_reorder_tab(
@@ -372,8 +377,9 @@ impl super::TermWindow {
         event: MouseEvent,
     ) {
         // Project the pointer onto the axis the tab bar runs along: x for a
-        // horizontal bar (Top/Bottom), y for a vertical bar (Left/Right).
-        let vertical = self.config.resolved_tab_bar_position().is_vertical();
+        // horizontal bar (Top/Bottom) or the child row, y for a vertical bar.
+        let in_row = item.y < self.row_bottom();
+        let vertical = self.config.resolved_tab_bar_position().is_vertical() && !in_row;
         let current = if vertical {
             event.coords.y
         } else {
@@ -388,8 +394,27 @@ impl super::TermWindow {
         let drag_forward = current.saturating_sub(start) > 0;
         let delta = if drag_forward { 1 } else { -1 };
 
-        let next_tab_idx = tab_idx.saturating_add_signed(delta);
-        if let Some(next_tab) = self.find_tab_item_by_idx(next_tab_idx) {
+        // The neighbour in the bar being dragged: the adjacent root for the
+        // side bar, the adjacent sibling for the row.
+        let next_tab_idx = {
+            let mux = Mux::get();
+            let Some(window) = mux.get_window(self.mux_window_id) else {
+                return;
+            };
+            if in_row || !self.is_tab_bar_vertical() {
+                tab_idx.saturating_add_signed(delta)
+            } else {
+                let roots = window.root_indices();
+                match roots.iter().position(|&i| i == tab_idx) {
+                    Some(r) => roots
+                        .get(r.saturating_add_signed(delta))
+                        .copied()
+                        .unwrap_or(tab_idx),
+                    None => tab_idx,
+                }
+            }
+        };
+        if let Some(next_tab) = self.find_tab_item_by_idx(next_tab_idx, in_row) {
             let (origin, size) = if vertical {
                 (next_tab.y, next_tab.height)
             } else {
@@ -399,7 +424,7 @@ impl super::TermWindow {
             let over_threshold = (drag_forward && current > next_tab_midpoint)
                 || (!drag_forward && current < next_tab_midpoint);
             if over_threshold && self.move_tab_relative(delta).is_ok() {
-                if let Some(tab) = self.find_tab_item_by_idx(next_tab_idx) {
+                if let Some(tab) = self.find_tab_item_by_idx(next_tab_idx, in_row) {
                     // Ensure we have updated tab index
                     item = tab.clone();
                 }

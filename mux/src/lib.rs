@@ -87,6 +87,10 @@ pub enum MuxNotification {
         tab_id: TabId,
         title: String,
     },
+    TabParentChanged {
+        tab_id: TabId,
+        parent: Option<TabId>,
+    },
     WindowTitleChanged {
         window_id: WindowId,
         title: String,

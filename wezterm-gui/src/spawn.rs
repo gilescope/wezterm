@@ -123,7 +123,7 @@ pub async fn spawn_command_internal(
             }
         }
         _ => {
-            let (_tab, pane, window_id) = mux
+            let (tab, pane, window_id) = mux
                 .spawn_tab_or_window(
                     match spawn_where {
                         SpawnWhere::NewWindow => None,
@@ -145,6 +145,11 @@ pub async fn spawn_command_internal(
             // the new window being created.
             if Some(window_id) == src_window_id {
                 pane.set_config(term_config);
+            }
+            if let Some(parent) = spawn.parent_tab_id {
+                if let Some(mut window) = mux.get_window_mut(window_id) {
+                    window.attach_tab_to_parent(tab.tab_id(), parent);
+                }
             }
         }
     };

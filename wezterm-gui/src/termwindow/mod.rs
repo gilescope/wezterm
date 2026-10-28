@@ -446,6 +446,9 @@ pub struct TermWindow {
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
 
     last_status_call: Instant,
+    /// Set while an alert-driven title rebuild is queued, so a burst of
+    /// alerts (one OSC 0 yields up to three) costs one rebuild.
+    title_update_pending: bool,
     cursor_blink_state: RefCell<ColorEase>,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
@@ -789,6 +792,7 @@ impl TermWindow {
                 &config,
             )),
             last_status_call: Instant::now(),
+            title_update_pending: false,
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
                 config.cursor_blink_ease_in,
@@ -1237,8 +1241,12 @@ impl TermWindow {
                 } => {
                     self.emit_user_var_event(pane_id, name, value);
                 }
-                MuxNotification::WindowTitleChanged { .. }
-                | MuxNotification::Alert {
+                MuxNotification::WindowTitleChanged { window_id, .. } => {
+                    if window_id == self.mux_window_id {
+                        self.request_title_update();
+                    }
+                }
+                MuxNotification::Alert {
                     alert:
                         Alert::OutputSinceFocusLost
                         | Alert::CurrentWorkingDirectoryChanged
@@ -1246,9 +1254,13 @@ impl TermWindow {
                         | Alert::TabTitleChanged(_)
                         | Alert::IconTitleChanged(_)
                         | Alert::Progress(_),
-                    ..
+                    pane_id,
                 } => {
-                    self.update_title();
+                    // Every GUI window subscribes to every pane's alerts;
+                    // only the window holding the pane has a tab to redraw.
+                    if self.window_contains_pane(pane_id) {
+                        self.request_title_update();
+                    }
                 }
                 MuxNotification::Alert {
                     alert: Alert::PaletteChanged,
@@ -1928,6 +1940,26 @@ impl TermWindow {
     fn update_title(&mut self) {
         self.schedule_status_update();
         self.update_title_impl();
+    }
+
+    /// Queue one `update_title` for after the current notification batch.
+    /// Alerts arrive in bursts (an OSC 0 raises WindowTitleChanged,
+    /// IconTitleChanged and the mux's own WindowTitleChanged); rebuilding
+    /// synchronously on each would run the whole Lua title path three times.
+    fn request_title_update(&mut self) {
+        if self.title_update_pending {
+            return;
+        }
+        self.title_update_pending = true;
+        if let Some(window) = self.window.as_ref() {
+            window.notify(TermWindowNotif::Apply(Box::new(|tw| {
+                tw.title_update_pending = false;
+                tw.update_title();
+            })));
+        } else {
+            self.title_update_pending = false;
+            self.update_title();
+        }
     }
 
     fn window_contains_pane(&mut self, pane_id: PaneId) -> bool {

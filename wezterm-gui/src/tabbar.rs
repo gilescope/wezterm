@@ -51,65 +51,93 @@ struct TitleText {
     has_indeterminate: bool,
 }
 
-fn call_format_tab_title(
-    tab: &TabInformation,
+/// One `format-tab-title` request: which tab, whether it is hovered, and
+/// the width budget handed to the callback.
+#[derive(Clone, Copy, Debug)]
+struct TitleRequest {
+    tab_idx: usize,
+    hover: bool,
+    max_width: usize,
+}
+
+/// Run `format-tab-title` for every request in one Lua round-trip. The
+/// `tabs`, `panes` and `config` tables are built once per call rather than
+/// once per tab: with N tabs the old per-tab path serialised the whole
+/// Config 2N+1 times and N tab/pane objects 2N times, which is the CPU
+/// sink with ~40 tabs. Returns `None` for a request when no callback is
+/// registered or it returned nil.
+fn call_format_tab_titles(
     tab_info: &[TabInformation],
     pane_info: &[PaneInformation],
     config: &ConfigHandle,
-    hover: bool,
-    tab_max_width: usize,
-) -> Option<TitleText> {
+    requests: &[TitleRequest],
+) -> Vec<Option<TitleText>> {
+    use mlua::IntoLua;
+
+    if requests.is_empty() {
+        return vec![];
+    }
     match config::run_immediate_with_lua_config(|lua| {
-        if let Some(lua) = lua {
-            let tabs = lua.create_sequence_from(tab_info.iter().cloned())?;
-            let panes = lua.create_sequence_from(pane_info.iter().cloned())?;
+        let Some(lua) = lua else {
+            return Ok(vec![None; requests.len()]);
+        };
+        let tabs = lua.create_sequence_from(tab_info.iter().cloned())?;
+        let panes = lua.create_sequence_from(pane_info.iter().cloned())?;
+        let config = (**config).clone().into_lua(&*lua)?;
 
-            let v = config::lua::emit_sync_callback(
-                &*lua,
-                (
-                    "format-tab-title".to_string(),
+        requests
+            .iter()
+            .map(|req| {
+                let tab: mlua::Value = tabs.raw_get(req.tab_idx + 1)?;
+                let v = config::lua::emit_sync_callback(
+                    &*lua,
                     (
-                        tab.clone(),
-                        tabs,
-                        panes,
-                        (**config).clone(),
-                        hover,
-                        tab_max_width,
+                        "format-tab-title".to_string(),
+                        (
+                            tab,
+                            tabs.clone(),
+                            panes.clone(),
+                            config.clone(),
+                            req.hover,
+                            req.max_width,
+                        ),
                     ),
-                ),
-            )?;
-            match &v {
-                mlua::Value::Nil => Ok(None),
-                mlua::Value::Table(_) => {
-                    let items = <Vec<FormatItem>>::from_lua(v, &*lua)?;
-
-                    let esc = format_as_escapes(items.clone())?;
-                    let line = parse_status_text(&esc, CellAttributes::default());
-
-                    Ok(Some(TitleText {
-                        items,
-                        len: line.len(),
-                        has_indeterminate: false,
-                    }))
-                }
-                _ => {
-                    let s = String::from_lua(v, &*lua)?;
-                    let line = parse_status_text(&s, CellAttributes::default());
-                    Ok(Some(TitleText {
-                        len: line.len(),
-                        items: vec![FormatItem::Text(s)],
-                        has_indeterminate: false,
-                    }))
-                }
-            }
-        } else {
-            Ok(None)
-        }
+                )?;
+                title_text_from_lua(&*lua, v)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
     }) {
         Ok(s) => s,
         Err(err) => {
             log::warn!("format-tab-title: {}", err);
-            None
+            vec![None; requests.len()]
+        }
+    }
+}
+
+fn title_text_from_lua(lua: &mlua::Lua, v: mlua::Value) -> anyhow::Result<Option<TitleText>> {
+    match &v {
+        mlua::Value::Nil => Ok(None),
+        mlua::Value::Table(_) => {
+            let items = <Vec<FormatItem>>::from_lua(v, lua)?;
+
+            let esc = format_as_escapes(items.clone())?;
+            let line = parse_status_text(&esc, CellAttributes::default());
+
+            Ok(Some(TitleText {
+                items,
+                len: line.len(),
+                has_indeterminate: false,
+            }))
+        }
+        _ => {
+            let s = String::from_lua(v, lua)?;
+            let line = parse_status_text(&s, CellAttributes::default());
+            Ok(Some(TitleText {
+                len: line.len(),
+                items: vec![FormatItem::Text(s)],
+                has_indeterminate: false,
+            }))
         }
     }
 }
@@ -200,104 +228,107 @@ fn spinner_phase(tab_id: usize) -> u64 {
     z ^ (z >> 31)
 }
 
-fn compute_tab_title(
-    tab: &TabInformation,
+/// Titles for `requests`, in order: the Lua callback's answer where it
+/// gave one, else the built-in rendering.
+fn compute_tab_titles(
     tab_info: &[TabInformation],
     pane_info: &[PaneInformation],
     config: &ConfigHandle,
-    hover: bool,
-    tab_max_width: usize,
-) -> TitleText {
-    let title = call_format_tab_title(tab, tab_info, pane_info, config, hover, tab_max_width);
+    requests: &[TitleRequest],
+) -> Vec<TitleText> {
+    call_format_tab_titles(tab_info, pane_info, config, requests)
+        .into_iter()
+        .zip(requests)
+        .map(|(title, req)| {
+            title.unwrap_or_else(|| builtin_tab_title(&tab_info[req.tab_idx], config))
+        })
+        .collect()
+}
 
-    match title {
-        Some(title) => title,
-        None => {
-            let mut items = vec![];
-            let mut len = 0;
-            let mut has_indeterminate = false;
+fn builtin_tab_title(tab: &TabInformation, config: &ConfigHandle) -> TitleText {
+    let mut items = vec![];
+    let mut len = 0;
+    let mut has_indeterminate = false;
 
-            if let Some(pane) = &tab.active_pane {
-                let mut title = if tab.tab_title.is_empty() {
-                    pane.title.clone()
+    if let Some(pane) = &tab.active_pane {
+        let mut title = if tab.tab_title.is_empty() {
+            pane.title.clone()
+        } else {
+            tab.tab_title.clone()
+        };
+
+        let classic_spacing = if effective_use_fancy_tab_bar(config) {
+            ""
+        } else {
+            " "
+        };
+        if config.show_tab_index_in_tab_bar {
+            let index = format!(
+                "{classic_spacing}{}: ",
+                tab.tab_index
+                    + if config.tab_and_split_indices_are_zero_based {
+                        0
+                    } else {
+                        1
+                    }
+            );
+            len += unicode_column_width(&index, None);
+            items.push(FormatItem::Text(index));
+
+            title = format!("{}{classic_spacing}", title);
+        }
+
+        match pane.progress {
+            Progress::None => {}
+            Progress::Percentage(pct) | Progress::Error(pct) => {
+                let graphic = format!("{} ", pct_to_glyph(pct));
+                len += unicode_column_width(&graphic, None);
+                let color = if matches!(pane.progress, Progress::Percentage(_)) {
+                    FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Green))
                 } else {
-                    tab.tab_title.clone()
+                    FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Red))
                 };
-
-                let classic_spacing = if effective_use_fancy_tab_bar(config) {
-                    ""
-                } else {
-                    " "
-                };
-                if config.show_tab_index_in_tab_bar {
-                    let index = format!(
-                        "{classic_spacing}{}: ",
-                        tab.tab_index
-                            + if config.tab_and_split_indices_are_zero_based {
-                                0
-                            } else {
-                                1
-                            }
-                    );
-                    len += unicode_column_width(&index, None);
-                    items.push(FormatItem::Text(index));
-
-                    title = format!("{}{classic_spacing}", title);
-                }
-
-                match pane.progress {
-                    Progress::None => {}
-                    Progress::Percentage(pct) | Progress::Error(pct) => {
-                        let graphic = format!("{} ", pct_to_glyph(pct));
-                        len += unicode_column_width(&graphic, None);
-                        let color = if matches!(pane.progress, Progress::Percentage(_)) {
-                            FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Green))
-                        } else {
-                            FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Red))
-                        };
-                        items.push(color);
-                        items.push(FormatItem::Text(graphic));
-                        items.push(FormatItem::Foreground(FormatColor::Default));
-                    }
-                    Progress::Indeterminate => {
-                        has_indeterminate = true;
-                        let graphic = format!(
-                            "{} ",
-                            indeterminate_spinner_glyph(spinner_phase(tab.tab_id))
-                        );
-                        len += unicode_column_width(&graphic, None);
-                        items.push(FormatItem::Foreground(FormatColor::AnsiColor(
-                            AnsiColor::Green,
-                        )));
-                        items.push(FormatItem::Text(graphic));
-                        items.push(FormatItem::Foreground(FormatColor::Default));
-                    }
-                }
-
-                // We have a preferred soft minimum on tab width to make it
-                // easier to click on tab titles, but we'll still go below
-                // this if there are too many tabs to fit the window at
-                // this width.
-                if !effective_use_fancy_tab_bar(config) {
-                    while len + unicode_column_width(&title, None) < 5 {
-                        title.push(' ');
-                    }
-                }
-
-                len += unicode_column_width(&title, None);
-                items.push(FormatItem::Text(title));
-            } else {
-                let title = " no pane ".to_string();
-                len += unicode_column_width(&title, None);
-                items.push(FormatItem::Text(title));
-            };
-
-            TitleText {
-                len,
-                items,
-                has_indeterminate,
+                items.push(color);
+                items.push(FormatItem::Text(graphic));
+                items.push(FormatItem::Foreground(FormatColor::Default));
+            }
+            Progress::Indeterminate => {
+                has_indeterminate = true;
+                let graphic = format!(
+                    "{} ",
+                    indeterminate_spinner_glyph(spinner_phase(tab.tab_id))
+                );
+                len += unicode_column_width(&graphic, None);
+                items.push(FormatItem::Foreground(FormatColor::AnsiColor(
+                    AnsiColor::Green,
+                )));
+                items.push(FormatItem::Text(graphic));
+                items.push(FormatItem::Foreground(FormatColor::Default));
             }
         }
+
+        // We have a preferred soft minimum on tab width to make it
+        // easier to click on tab titles, but we'll still go below
+        // this if there are too many tabs to fit the window at
+        // this width.
+        if !effective_use_fancy_tab_bar(config) {
+            while len + unicode_column_width(&title, None) < 5 {
+                title.push(' ');
+            }
+        }
+
+        len += unicode_column_width(&title, None);
+        items.push(FormatItem::Text(title));
+    } else {
+        let title = " no pane ".to_string();
+        len += unicode_column_width(&title, None);
+        items.push(FormatItem::Text(title));
+    };
+
+    TitleText {
+        len,
+        items,
+        has_indeterminate,
     }
 }
 
@@ -476,22 +507,21 @@ impl TabBarState {
         let mut active_tab_no = 0;
 
         let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar {
-            tab_info
+            let requests: Vec<TitleRequest> = tab_info
                 .iter()
-                .map(|tab| {
+                .enumerate()
+                .map(|(tab_idx, tab)| {
                     if tab.is_active {
                         active_tab_no = tab.tab_index;
                     }
-                    compute_tab_title(
-                        tab,
-                        tab_info,
-                        pane_info,
-                        config,
-                        false,
-                        config.tab_max_width,
-                    )
+                    TitleRequest {
+                        tab_idx,
+                        hover: false,
+                        max_width: config.tab_max_width,
+                    }
                 })
-                .collect()
+                .collect();
+            compute_tab_titles(tab_info, pane_info, config, &requests)
         } else {
             vec![]
         };
@@ -557,16 +587,21 @@ impl TabBarState {
             let active = tab_idx == active_tab_no;
             let hover = !active && is_tab_hover(mouse_x, x, tab_title_len);
 
-            // Recompute the title so that it factors in both the hover state
-            // and the adjusted maximum tab width based on available space.
-            let tab_title = compute_tab_title(
-                &tab_info[tab_idx],
-                tab_info,
-                pane_info,
-                config,
-                hover,
-                tab_title_len,
-            );
+            // The first pass already asked for this title unhovered with the
+            // full width budget; only hover or a clamped width can change the
+            // answer, so only then pay for another callback.
+            let recomputed;
+            let tab_title = if hover || tab_title.len > tab_title_len {
+                let req = TitleRequest {
+                    tab_idx,
+                    hover,
+                    max_width: tab_title_len,
+                };
+                recomputed = compute_tab_titles(tab_info, pane_info, config, &[req]).remove(0);
+                &recomputed
+            } else {
+                tab_title
+            };
 
             let cell_attrs = if active {
                 &active_cell_attrs
@@ -832,4 +867,128 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
     });
     flush_print(&mut print_buffer, &mut cells, &pen);
     Line::from_cells(cells, SEQ_ZERO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    fn pane(id: usize) -> PaneInformation {
+        PaneInformation {
+            pane_id: id,
+            pane_index: 0,
+            is_active: true,
+            is_zoomed: false,
+            has_unseen_output: false,
+            left: 0,
+            top: 0,
+            width: 80,
+            height: 24,
+            pixel_width: 640,
+            pixel_height: 384,
+            title: format!("pane{id}"),
+            user_vars: HashMap::new(),
+            progress: Progress::None,
+        }
+    }
+
+    fn tabs(n: usize) -> (Vec<TabInformation>, Vec<PaneInformation>) {
+        let tabs = (0..n)
+            .map(|i| TabInformation {
+                tab_id: i,
+                tab_index: i,
+                is_active: i == 0,
+                is_last_active: false,
+                active_pane: Some(pane(i)),
+                window_id: 0,
+                tab_title: format!("tab{i}"),
+            })
+            .collect();
+        (tabs, (0..n).map(pane).collect())
+    }
+
+    /// Install a Lua config whose `format-tab-title` counts its invocations.
+    fn install_counting_callback() -> mlua::Lua {
+        config::use_test_configuration();
+        let lua = config::lua::make_lua_context(Path::new("/nonexistent/wezterm.lua"))
+            .expect("lua context");
+        lua.load(
+            r#"
+            local wezterm = require 'wezterm'
+            calls = 0
+            wezterm.on('format-tab-title', function(tab, tabs, panes, config, hover, max_width)
+                calls = calls + 1
+                return tab.tab_title
+            end)
+            "#,
+        )
+        .exec()
+        .expect("register callback");
+        lua
+    }
+
+    fn calls() -> usize {
+        config::run_immediate_with_lua_config(|lua| {
+            Ok(lua
+                .expect("lua installed")
+                .globals()
+                .get::<_, usize>("calls")?)
+        })
+        .unwrap()
+    }
+
+    fn build(mouse_x: Option<usize>, n: usize) -> TabBarState {
+        let (tab_info, pane_info) = tabs(n);
+        TabBarState::new(
+            200,
+            mouse_x,
+            &tab_info,
+            &pane_info,
+            None,
+            &config::configuration(),
+            "",
+            "",
+        )
+    }
+
+    /// One Lua round-trip per tab per rebuild. With 40 tabs the old
+    /// two-pass layout made 80 calls, each serialising the whole Config.
+    #[test]
+    fn format_tab_title_runs_once_per_tab() {
+        config::use_this_lua_context_for_tests(install_counting_callback());
+
+        let n = 7;
+        let state = build(None, n);
+        assert_eq!(
+            state
+                .items()
+                .iter()
+                .filter(|i| matches!(i.item, TabBarItem::Tab { .. }))
+                .count(),
+            n
+        );
+        assert_eq!(calls(), n);
+    }
+
+    /// Hovering recomputes only the hovered tab, so N+1 calls, not 2N.
+    #[test]
+    fn hover_recomputes_only_the_hovered_tab() {
+        config::use_this_lua_context_for_tests(install_counting_callback());
+
+        let n = 7;
+        // tab0 is active and occupies x 0..4 ("tab0"); hover tab1 at x=5.
+        let state = build(Some(5), n);
+        let hovered = state
+            .items()
+            .iter()
+            .find(|i| matches!(i.item, TabBarItem::Tab { tab_idx: 1, .. }))
+            .expect("tab1 present");
+        assert!(
+            hovered.x <= 5 && 5 < hovered.x + hovered.width,
+            "hover lands on tab1"
+        );
+        assert_eq!(calls(), n + 1);
+    }
 }

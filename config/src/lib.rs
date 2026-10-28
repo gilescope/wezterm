@@ -222,6 +222,18 @@ impl LuaConfigState {
     }
 }
 
+/// Install `lua` as the configuration Lua state for the calling thread.
+/// Test support only: lets unit tests register `wezterm.on` callbacks
+/// and observe how often the GUI invokes them.
+#[doc(hidden)]
+pub fn use_this_lua_context_for_tests(lua: mlua::Lua) {
+    LUA_PIPE
+        .sender
+        .try_send(lua)
+        .expect("LUA_PIPE has capacity");
+    designate_this_as_the_main_thread();
+}
+
 pub fn designate_this_as_the_main_thread() {
     LUA_CONFIG.with(|lc| {
         let mut lc = lc.borrow_mut();

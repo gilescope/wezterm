@@ -754,17 +754,28 @@ impl<'a> Performer<'a> {
                     handler.alert(Alert::IconTitleChanged(title));
                 }
             }
+            // Prompts and TUIs re-send an unchanged title on every redraw;
+            // each alert costs the GUI a tab-bar rebuild, so only alert on a
+            // real change.
             OperatingSystemCommand::SetIconNameAndWindowTitle(title) => {
-                self.icon_title.take();
+                let icon_changed = self.icon_title.take().is_some();
+                let changed = self.title != title;
                 self.title = title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::WindowTitleChanged(title.clone()));
-                    handler.alert(Alert::IconTitleChanged(Some(title)));
+                    if changed {
+                        handler.alert(Alert::WindowTitleChanged(title.clone()));
+                    }
+                    if changed || icon_changed {
+                        handler.alert(Alert::IconTitleChanged(Some(title)));
+                    }
                 }
             }
 
             OperatingSystemCommand::SetWindowTitleSun(title)
             | OperatingSystemCommand::SetWindowTitle(title) => {
+                if self.title == title {
+                    return;
+                }
                 self.title = title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::WindowTitleChanged(title));
@@ -938,7 +949,11 @@ impl<'a> Performer<'a> {
                 }
             }
             OperatingSystemCommand::CurrentWorkingDirectory(url) => {
-                self.current_dir = Url::parse(&url).ok();
+                let dir = Url::parse(&url).ok();
+                if self.current_dir == dir {
+                    return;
+                }
+                self.current_dir = dir;
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::CurrentWorkingDirectoryChanged);
                 }

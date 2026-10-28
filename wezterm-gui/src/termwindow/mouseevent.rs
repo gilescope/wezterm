@@ -36,10 +36,10 @@ impl super::TermWindow {
 
     fn leave_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
-            UIItemType::TabBar(_) => {
-                self.update_title_post_status();
-            }
-            UIItemType::CloseTab(_)
+            // The tab bar rebuild for a hover change happens once, at the end
+            // of mouse_event_impl, when the ui item actually changed.
+            UIItemType::TabBar(_)
+            | UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
@@ -253,7 +253,17 @@ impl super::TermWindow {
             );
         }
 
-        if prior_ui_item != ui_item {
+        // The classic (non-fancy) bar highlights by mouse column, so it must
+        // rebuild on every move over a tab; the fancy bar only on a change.
+        let classic_hover = !self.config.use_fancy_tab_bar
+            && matches!(
+                &prior_ui_item,
+                Some(UIItem {
+                    item_type: UIItemType::TabBar(_),
+                    ..
+                })
+            );
+        if prior_ui_item != ui_item || classic_hover {
             self.update_title_post_status();
         }
     }

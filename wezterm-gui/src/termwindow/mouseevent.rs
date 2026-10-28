@@ -9,7 +9,7 @@ use ::window::{
 use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
 use config::MouseEventAltScreen;
 use mux::pane::{Pane, WithPaneLines};
-use mux::tab::SplitDirection;
+use mux::tab::{SplitDirection, TabId};
 use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
@@ -43,6 +43,7 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
+            | UIItemType::TabBarSeparator
             | UIItemType::Split(_) => {}
         }
     }
@@ -54,6 +55,7 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
+            | UIItemType::TabBarSeparator
             | UIItemType::Split(_) => {}
         }
     }
@@ -68,12 +70,19 @@ impl super::TermWindow {
         self.current_mouse_event.replace(event.clone());
 
         let border = self.get_os_border();
+        let tab_pos = self.resolved_tab_bar_position();
 
-        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+        let first_line_offset = if self.show_tab_bar && tab_pos == config::TabBarPosition::Top {
             self.tab_bar_pixel_height().unwrap_or(0.) as isize
         } else {
             0
         } + border.top.get() as isize;
+
+        let left_bar_offset = if self.show_tab_bar && tab_pos == config::TabBarPosition::Left {
+            self.tab_bar_pixel_width() as isize
+        } else {
+            0
+        };
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -88,6 +97,7 @@ impl super::TermWindow {
         let x = (event
             .coords
             .x
+            .sub(left_bar_offset)
             .sub((padding_left + border.left.get() as f32) as isize)
             .max(0) as f32)
             / self.render_metrics.cell_size.width as f32;
@@ -112,6 +122,7 @@ impl super::TermWindow {
         let mut x_pixel_offset = event
             .coords
             .x
+            .sub(left_bar_offset)
             .sub((padding_left + border.left.get() as f32) as isize);
         if x > 0 {
             x_pixel_offset = x_pixel_offset.max(0) % self.render_metrics.cell_size.width;
@@ -130,7 +141,10 @@ impl super::TermWindow {
                     return;
                 }
                 if press == &MousePress::Left && self.dragging.take().is_some() {
-                    // Completed a drag
+                    // Completed a drag; rebuild the (cached) tab bar and repaint
+                    // so the drag highlight clears.
+                    self.invalidate_fancy_tab_bar();
+                    context.invalidate();
                     return;
                 }
             }
@@ -295,15 +309,16 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
-        let tab_bar_height = if self.show_tab_bar {
+        let scroll_tab_pos = self.resolved_tab_bar_position();
+        let tab_bar_height = if self.show_tab_bar && !scroll_tab_pos.is_vertical() {
             self.tab_bar_pixel_height().unwrap_or(0.)
         } else {
             0.
         };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
+        let (top_bar_height, bottom_bar_height) = match scroll_tab_pos {
+            config::TabBarPosition::Bottom => (0.0, tab_bar_height),
+            config::TabBarPosition::Top => (tab_bar_height, 0.0),
+            _ => (0.0, 0.0),
         };
 
         let border = self.get_os_border();
@@ -332,6 +347,61 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
+    fn find_tab_item_by_idx(&mut self, target_tab_idx: TabId) -> Option<&UIItem> {
+        self.ui_items.iter().find(|item| match item.item_type {
+            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => tab_idx == target_tab_idx,
+            _ => false,
+        })
+    }
+
+    fn drag_reorder_tab(
+        &mut self,
+        mut item: UIItem,
+        tab_idx: TabId,
+        start_event: MouseEvent,
+        event: MouseEvent,
+    ) {
+        // Project the pointer onto the axis the tab bar runs along: x for a
+        // horizontal bar (Top/Bottom), y for a vertical bar (Left/Right).
+        let vertical = self.config.resolved_tab_bar_position().is_vertical();
+        let current = if vertical {
+            event.coords.y
+        } else {
+            event.coords.x
+        };
+        let start = if vertical {
+            start_event.coords.y
+        } else {
+            start_event.coords.x
+        };
+
+        let drag_forward = current.saturating_sub(start) > 0;
+        let delta = if drag_forward { 1 } else { -1 };
+
+        let next_tab_idx = tab_idx.saturating_add_signed(delta);
+        if let Some(next_tab) = self.find_tab_item_by_idx(next_tab_idx) {
+            let (origin, size) = if vertical {
+                (next_tab.y, next_tab.height)
+            } else {
+                (next_tab.x, next_tab.width)
+            };
+            let next_tab_midpoint = origin.saturating_add(size / 2) as isize;
+            let over_threshold = (drag_forward && current > next_tab_midpoint)
+                || (!drag_forward && current < next_tab_midpoint);
+            if over_threshold && self.move_tab_relative(delta).is_ok() {
+                if let Some(tab) = self.find_tab_item_by_idx(next_tab_idx) {
+                    // Ensure we have updated tab index
+                    item = tab.clone();
+                }
+            }
+        }
+
+        // We are only interested in the moment to moment direction of dragging; not
+        // the overall (from first click that initiated drag), so we always replace
+        // the start_event.
+        self.dragging.replace((item, event));
+    }
+
     fn drag_ui_item(
         &mut self,
         item: UIItem,
@@ -347,6 +417,12 @@ impl super::TermWindow {
             }
             UIItemType::ScrollThumb => {
                 self.drag_scroll_thumb(item, start_event, event, context);
+            }
+            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => {
+                self.drag_reorder_tab(item, tab_idx, start_event, event);
+            }
+            UIItemType::TabBarSeparator => {
+                self.drag_tab_bar_separator(item, event, context);
             }
             _ => {
                 log::error!("drag not implemented for {:?}", item);
@@ -364,8 +440,8 @@ impl super::TermWindow {
     ) {
         self.last_ui_item.replace(item.clone());
         match item.item_type {
-            UIItemType::TabBar(item) => {
-                self.mouse_event_tab_bar(item, event, context);
+            UIItemType::TabBar(tab_bar_item) => {
+                self.mouse_event_tab_bar(item, tab_bar_item, event, context);
             }
             UIItemType::AboveScrollThumb => {
                 self.mouse_event_above_scroll_thumb(item, pane, event, context);
@@ -382,7 +458,56 @@ impl super::TermWindow {
             UIItemType::CloseTab(idx) => {
                 self.mouse_event_close_tab(idx, event, context);
             }
+            UIItemType::TabBarSeparator => {
+                self.mouse_event_tab_bar_separator(item, event, context);
+            }
         }
+    }
+
+    pub fn mouse_event_tab_bar_separator(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        context.set_cursor(Some(CursorIcon::EwResize));
+        if event.kind == WMEK::Press(MousePress::Left) {
+            self.dragging.replace((item, event));
+        }
+    }
+
+    /// Resize the vertical tab bar by dragging its inner-edge separator.
+    /// Updates the runtime width override and re-lays-out the terminal area.
+    fn drag_tab_bar_separator(&mut self, item: UIItem, event: MouseEvent, context: &dyn WindowOps) {
+        let border = self.get_os_border();
+        let mouse_x = event.coords.x as f32;
+        let new_width = match self.resolved_tab_bar_position() {
+            config::TabBarPosition::Left => mouse_x - border.left.get() as f32,
+            config::TabBarPosition::Right => {
+                (self.dimensions.pixel_width as f32 - border.right.get() as f32) - mouse_x
+            }
+            // Horizontal bar: there is no width separator to drag.
+            _ => {
+                self.dragging.replace((item, event));
+                return;
+            }
+        };
+
+        // Clamp to a sane range: at least a few cells, at most 80% of the window.
+        let min_w = (self.render_metrics.cell_size.width as f32 * 4.).max(40.);
+        let max_w = self.dimensions.pixel_width as f32 * 0.8;
+        let new_width = new_width.clamp(min_w, max_w);
+
+        if (self.tab_bar_pixel_width() - new_width).abs() >= 1. {
+            self.tab_bar_width_override = Some(new_width);
+            self.invalidate_fancy_tab_bar();
+            if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
+                let dims = self.dimensions;
+                self.apply_dimensions(&dims, None, &window);
+            }
+            context.invalidate();
+        }
+        self.dragging.replace((item, event));
     }
 
     pub fn mouse_event_close_tab(
@@ -455,14 +580,17 @@ impl super::TermWindow {
 
     pub fn mouse_event_tab_bar(
         &mut self,
-        item: TabBarItem,
+        item: UIItem,
+        tab_bar_item: TabBarItem,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
         match event.kind {
-            WMEK::Press(MousePress::Left) => match item {
+            WMEK::Press(MousePress::Left) => match tab_bar_item {
                 TabBarItem::Tab { tab_idx, .. } => {
                     self.activate_tab(tab_idx as isize).ok();
+                    // For reordering tabs
+                    self.dragging = Some((item, event));
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);
@@ -510,7 +638,7 @@ impl super::TermWindow {
                     }
                 }
             },
-            WMEK::Press(MousePress::Middle) => match item {
+            WMEK::Press(MousePress::Middle) => match tab_bar_item {
                 TabBarItem::Tab { tab_idx, .. } => {
                     self.close_specific_tab(tab_idx, true);
                 }
@@ -522,19 +650,19 @@ impl super::TermWindow {
                 | TabBarItem::RightStatus
                 | TabBarItem::WindowButton(_) => {}
             },
-            WMEK::Press(MousePress::Right) => match item {
+            WMEK::Press(MousePress::Right) => match tab_bar_item {
                 TabBarItem::Tab { .. } => {
                     self.show_tab_navigator();
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Right);
                 }
-                TabBarItem::None
-                | TabBarItem::LeftStatus
-                | TabBarItem::RightStatus
-                | TabBarItem::WindowButton(_) => {}
+                TabBarItem::None => {
+                    self.show_tab_bar_position_picker();
+                }
+                TabBarItem::LeftStatus | TabBarItem::RightStatus | TabBarItem::WindowButton(_) => {}
             },
-            WMEK::Move => match item {
+            WMEK::Move => match tab_bar_item {
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
                     context.set_window_drag_position(event.screen_coords);
                 }

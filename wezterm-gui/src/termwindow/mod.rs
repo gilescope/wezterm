@@ -160,6 +160,9 @@ pub enum UIItemType {
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
+    /// Draggable handle on the inner edge of a vertical (Left/Right) tab bar,
+    /// used to resize the tab bar width.
+    TabBarSeparator,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -395,6 +398,13 @@ pub struct TermWindow {
     show_scroll_bar: bool,
     tab_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
+    /// Runtime override for the vertical tab bar width, set by dragging the
+    /// separator. `None` falls back to `config.tab_bar_width`. Session-only.
+    tab_bar_width_override: Option<f32>,
+    /// Active matrix-rain tab-switch transition, if any.
+    tab_switch_anim: Option<crate::termwindow::render::matrix_rain::TabSwitchAnim>,
+    /// Lazily-shaped katakana/digit glyph palette for the matrix rain.
+    matrix_rain_palette: Option<Vec<wezterm_font::GlyphInfo>>,
     pub right_status: String,
     pub left_status: String,
     last_ui_item: Option<UIItem>,
@@ -608,7 +618,8 @@ impl TermWindow {
         // Initially we have only a single tab, so take that into account
         // for the tab bar state.
         let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        let tab_bar_height = if show_tab_bar {
+        let is_vertical_tab_bar = config.resolved_tab_bar_position().is_vertical();
+        let tab_bar_height = if show_tab_bar && !is_vertical_tab_bar {
             Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? as usize
         } else {
             0
@@ -654,8 +665,24 @@ impl TermWindow {
         let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
         let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
 
-        let mut dimensions = Dimensions {
+        // For vertical tab bar, we need a temporary Dimensions to compute the tab bar width.
+        // The tab_bar_pixel_width_impl needs dimensions for DPI.
+        let temp_dims = Dimensions {
             pixel_width: (terminal_size.pixel_width + padding_left + padding_right) as usize,
+            pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as usize)
+                + padding_top
+                + padding_bottom) as usize,
+            dpi,
+        };
+        let tab_bar_width = if show_tab_bar && is_vertical_tab_bar {
+            Self::tab_bar_pixel_width_impl(&config, &render_metrics, &temp_dims) as usize
+        } else {
+            0
+        };
+
+        let mut dimensions = Dimensions {
+            pixel_width: (terminal_size.pixel_width + padding_left + padding_right) as usize
+                + tab_bar_width,
             pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize
@@ -717,6 +744,9 @@ impl TermWindow {
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
             fancy_tab_bar: None,
+            tab_bar_width_override: None,
+            tab_switch_anim: None,
+            matrix_rain_palette: None,
             right_status: String::new(),
             left_status: String::new(),
             last_mouse_coords: (0, -1),
@@ -874,6 +904,7 @@ impl TermWindow {
                         padding_bottom: padding_bottom,
                         border: border,
                         tab_bar_height: tab_bar_height,
+                        tab_bar_width: tab_bar_width,
                     }
                     .into(),
                 );
@@ -1959,6 +1990,23 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    /// If the mouse is hovering a tab in the tab bar, return that tab's title
+    /// for display in the OS window title. `None` when not hovering a tab.
+    fn hovered_tab_title(&self, tabs: &[TabInformation]) -> Option<String> {
+        // Only while the pointer is inside the window.
+        self.current_mouse_event.as_ref()?;
+        let tab_idx = match self.last_ui_item.as_ref()?.item_type {
+            UIItemType::TabBar(crate::tabbar::TabBarItem::Tab { tab_idx, .. }) => tab_idx,
+            _ => return None,
+        };
+        let info = tabs.iter().find(|t| t.tab_index == tab_idx)?;
+        if !info.tab_title.is_empty() {
+            Some(info.tab_title.clone())
+        } else {
+            info.active_pane.as_ref().map(|p| p.title.clone())
+        }
+    }
+
     fn update_title_impl(&mut self) {
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
@@ -1971,26 +2019,45 @@ impl TermWindow {
         let active_pane = panes.iter().find(|p| p.is_active).cloned();
 
         let border = self.get_os_border();
+        let tab_pos = self.resolved_tab_bar_position();
         let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
-        let tab_bar_y = if self.config.tab_bar_at_bottom {
-            ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
-                .max(0.)
-        } else {
-            border.top.get() as f32
-        };
-
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+        let tab_bar_width = self.tab_bar_pixel_width();
 
         let hovering_in_tab_bar = match &self.current_mouse_event {
             Some(event) => {
-                let mouse_y = event.coords.y as f32;
-                mouse_y >= tab_bar_y as f32 && mouse_y < tab_bar_y as f32 + tab_bar_height
+                if tab_pos.is_vertical() {
+                    let mouse_x = event.coords.x as f32;
+                    let tab_bar_x = if tab_pos == config::TabBarPosition::Left {
+                        border.left.get() as f32
+                    } else {
+                        (self.dimensions.pixel_width as f32)
+                            - tab_bar_width
+                            - border.right.get() as f32
+                    };
+                    mouse_x >= tab_bar_x && mouse_x < tab_bar_x + tab_bar_width
+                } else {
+                    let mouse_y = event.coords.y as f32;
+                    let tab_bar_y = if tab_pos == config::TabBarPosition::Bottom {
+                        ((self.dimensions.pixel_height as f32)
+                            - (tab_bar_height + border.bottom.get() as f32))
+                            .max(0.)
+                    } else {
+                        border.top.get() as f32
+                    };
+                    mouse_y >= tab_bar_y && mouse_y < tab_bar_y + tab_bar_height
+                }
             }
             None => false,
         };
 
+        let tab_bar_cols = if tab_pos.is_vertical() {
+            (tab_bar_width as usize) / self.render_metrics.cell_size.width as usize
+        } else {
+            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize
+        };
+
         let new_tab_bar = TabBarState::new(
-            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
+            tab_bar_cols,
             if hovering_in_tab_bar {
                 Some(self.last_mouse_coords.0)
             } else {
@@ -2072,6 +2139,10 @@ impl TermWindow {
             }
         };
 
+        // While the mouse hovers over a tab, surface that tab's title in the OS
+        // window title; it reverts to `title` as soon as the pointer leaves.
+        let title = self.hovered_tab_title(&tabs).unwrap_or(title);
+
         if let Some(window) = self.window.as_ref() {
             window.set_title(&title);
 
@@ -2114,8 +2185,14 @@ impl TermWindow {
         if let Some(win) = self.window.as_ref() {
             let cursor = pos.pane.get_cursor_position();
             let top = pos.pane.get_dimensions().physical_top;
-            let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            let tab_pos = self.resolved_tab_bar_position();
+            let tab_bar_height = if self.show_tab_bar && tab_pos == config::TabBarPosition::Top {
                 self.tab_bar_pixel_height().unwrap()
+            } else {
+                0.0
+            };
+            let left_bar_width = if self.show_tab_bar && tab_pos == config::TabBarPosition::Left {
+                self.tab_bar_pixel_width()
             } else {
                 0.0
             };
@@ -2124,7 +2201,8 @@ impl TermWindow {
             let r = Rect::new(
                 Point::new(
                     (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
-                        .add(padding_left as isize),
+                        .add(padding_left as isize)
+                        .add(left_bar_width as isize),
                     ((cursor.y + pos.top as isize - top).max(0)
                         * self.render_metrics.cell_size.height)
                         .add(tab_bar_height as isize)
@@ -2179,6 +2257,11 @@ impl TermWindow {
 
     fn activate_tab(&mut self, tab_idx: isize) -> anyhow::Result<()> {
         let mux = Mux::get();
+        // Capture the outgoing active pane BEFORE taking the window lock below:
+        // get_active_pane_or_overlay locks the mux itself, so calling it while
+        // holding get_window_mut would re-enter the lock and deadlock.
+        let prev_pane = self.get_active_pane_or_overlay();
+
         let mut window = mux
             .get_window_mut(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
@@ -2194,12 +2277,16 @@ impl TermWindow {
         };
 
         if tab_idx < max {
+            let changed = window.get_active_tab_idx() != tab_idx;
             window.remember_and_set_active_tab_idx(tab_idx);
 
             drop(window);
 
             if let Some(pane) = self.get_active_pane_or_overlay() {
                 pane.focus_changed(true);
+                if changed {
+                    self.start_matrix_rain(prev_pane, &pane);
+                }
             }
 
             self.update_title();
@@ -2383,6 +2470,67 @@ impl TermWindow {
             alphabet: None,
         };
         self.show_launcher_impl(args, active_tab_idx);
+    }
+
+    /// Apply `pos` as a runtime config override and re-render. Preserves any
+    /// other overrides already in effect (e.g. opacity set via lua).
+    pub fn set_tab_bar_position(&mut self, pos: config::TabBarPosition) {
+        use wezterm_dynamic::{ToDynamic, Value};
+        let mut obj = match self.config_overrides.clone() {
+            Value::Object(o) => o,
+            _ => std::collections::BTreeMap::new().into(),
+        };
+        obj.insert(
+            Value::String("tab_bar_position".to_string()),
+            pos.to_dynamic(),
+        );
+        let value = Value::Object(obj);
+        if value != self.config_overrides {
+            self.config_overrides = value;
+            self.config_was_reloaded();
+        }
+    }
+
+    fn cycle_tab_bar_position(&mut self) {
+        use config::TabBarPosition::*;
+        let next = match self.config.resolved_tab_bar_position() {
+            Top => Left,
+            Left => Bottom,
+            Bottom => Right,
+            Right => Top,
+        };
+        self.set_tab_bar_position(next);
+    }
+
+    /// Overlay picker listing the four tab-bar positions, the active one
+    /// marked. Selection routes through `KeyAssignment::SetTabBarPosition`
+    /// (dispatched in Rust by the selector overlay; no lua callback needed).
+    pub fn show_tab_bar_position_picker(&mut self) {
+        use config::keyassignment::{InputSelector, InputSelectorEntry, KeyAssignment};
+        use config::TabBarPosition;
+        let current = self.config.resolved_tab_bar_position();
+        let choices = [
+            TabBarPosition::Top,
+            TabBarPosition::Bottom,
+            TabBarPosition::Left,
+            TabBarPosition::Right,
+        ]
+        .iter()
+        .map(|pos| InputSelectorEntry {
+            label: format!("{} {pos:?}", if *pos == current { "✓" } else { " " }),
+            id: Some(format!("{pos:?}")),
+        })
+        .collect();
+        let args = InputSelector {
+            action: Box::new(KeyAssignment::SetTabBarPosition(current)),
+            title: "Select tab bar position".to_string(),
+            choices,
+            fuzzy: false,
+            alphabet: "1234".to_string(),
+            description: "Select the tab bar position".to_string(),
+            fuzzy_description: String::new(),
+        };
+        self.show_input_selector(&args);
     }
 
     fn show_launcher(&mut self) {
@@ -3163,6 +3311,8 @@ impl TermWindow {
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
+            SetTabBarPosition(pos) => self.set_tab_bar_position(*pos),
+            CycleTabBarPosition => self.cycle_tab_bar_position(),
         };
         Ok(PerformAssignmentResult::Handled)
     }

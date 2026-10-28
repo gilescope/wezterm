@@ -10,8 +10,7 @@
 
 use crate::color::LinearRgba;
 use crate::customglyph::BlockKey;
-use crate::quad::QuadTrait;
-use crate::quad::{TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use mux::pane::{Pane, PaneId};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -273,7 +272,8 @@ impl crate::TermWindow {
         let border = self.get_os_border();
         let cell_w = self.render_metrics.cell_size.width as f32;
         let cell_h = self.render_metrics.cell_size.height as f32;
-        let x = left_bar_width + padding_left + border.left.get() as f32 + pane_left as f32 * cell_w;
+        let x =
+            left_bar_width + padding_left + border.left.get() as f32 + pane_left as f32 * cell_w;
         let y = top_bar_height + padding_top + border.top.get() as f32 + pane_top as f32 * cell_h;
         (x, y)
     }
@@ -311,7 +311,12 @@ impl crate::TermWindow {
         let gx = ox + col as f32 * cell_w + (cell_w - gw) / 2.0;
         let gy = oy + row_f * cell_h + (cell_h - gh) / 2.0;
         let mut quad = layers.allocate(LAYER)?;
-        quad.set_position(gx - left_off, gy - top_off, gx + gw - left_off, gy + gh - top_off);
+        quad.set_position(
+            gx - left_off,
+            gy - top_off,
+            gx + gw - left_off,
+            gy + gh - top_off,
+        );
         quad.set_fg_color(color);
         quad.set_texture(texture.texture_coords());
         quad.set_has_color(glyph.has_color);

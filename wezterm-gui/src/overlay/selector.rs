@@ -1,9 +1,8 @@
 use crate::overlay::quickselect;
 use crate::scripting::guiwin::GuiWin;
 use crate::termwindow::TermWindowNotif;
-use config::configuration;
 use config::keyassignment::{InputSelector, InputSelectorEntry, KeyAssignment};
-use config::TabBarPosition;
+use config::{configuration, TabBarPosition};
 use mux::termwiztermtab::TermWizTerminal;
 use mux_lua::MuxPane;
 use nucleo_matcher::pattern::Pattern;

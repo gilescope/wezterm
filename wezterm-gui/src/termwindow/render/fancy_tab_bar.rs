@@ -460,16 +460,32 @@ impl crate::TermWindow {
         // the active tab is in view. Tabs pushed above the top just draw
         // off-screen; the wheel and the keys walk through them.
         let avail = self.dimensions.pixel_height as f32 - (border.top + border.bottom).get() as f32;
-        let active_bottom = computed
-            .ui_items()
-            .into_iter()
-            .find(|item| {
-                matches!(
-                    item.item_type,
-                    UIItemType::TabBar(TabBarItem::Tab { active: true, .. })
-                )
-            })
-            .map(|item| (item.y + item.height) as f32 + metrics.cell_size.height as f32 * 0.5);
+        let ui_items = computed.ui_items();
+        let bottom_of = |item: &UIItem| (item.y + item.height) as f32;
+        let active = ui_items.iter().find(|item| {
+            matches!(
+                item.item_type,
+                UIItemType::TabBar(TabBarItem::Tab { active: true, .. })
+            )
+        });
+        let last_tab = ui_items
+            .iter()
+            .filter(|item| matches!(item.item_type, UIItemType::TabBar(TabBarItem::Tab { .. })))
+            .max_by_key(|item| item.y);
+        let new_tab = ui_items
+            .iter()
+            .find(|item| matches!(item.item_type, UIItemType::TabBar(TabBarItem::NewTabButton)));
+        // Keep the active tab in view; when it is the last one, keep the `+`
+        // below it in view too, so the end of the list always offers a new tab.
+        let active_bottom = active.map(|a| {
+            let mut bottom = bottom_of(a);
+            if last_tab.is_some_and(|l| l.y == a.y) {
+                if let Some(plus) = new_tab {
+                    bottom = bottom.max(bottom_of(plus));
+                }
+            }
+            bottom + metrics.cell_size.height as f32 * 0.5
+        });
         if let Some(bottom) = active_bottom {
             let overflow = bottom - avail;
             if overflow > 0. {

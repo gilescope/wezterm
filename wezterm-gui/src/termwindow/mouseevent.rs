@@ -628,7 +628,13 @@ impl super::TermWindow {
                     self.dragging = Some((item, event));
                 }
                 TabBarItem::NewTabButton { .. } => {
-                    self.do_new_tab_button_click(MousePress::Left);
+                    // The `+` in the child row makes a child of the active
+                    // root; the side bar's `+` makes a new root tab.
+                    if item.y < self.row_bottom() {
+                        self.spawn_child_tab(&SpawnTabDomain::CurrentPaneDomain);
+                    } else {
+                        self.do_new_tab_button_click(MousePress::Left);
+                    }
                 }
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
                     let maximized = self
@@ -717,7 +723,9 @@ impl super::TermWindow {
             },
             WMEK::VertWheel(n) => {
                 if self.config.mouse_wheel_scrolls_tabs {
-                    self.activate_tab_relative(if n < 1 { 1 } else { -1 }, true)
+                    // Stop at either end rather than wrapping: with a long
+                    // side bar, wrapping past the last tab is a surprise.
+                    self.activate_tab_relative(if n < 1 { 1 } else { -1 }, false)
                         .ok();
                 }
             }

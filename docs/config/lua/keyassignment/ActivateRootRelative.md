@@ -4,8 +4,8 @@
 
 Activate a root (side-bar) tab relative to the current one, skipping child
 tabs created with [SpawnChildTab](SpawnChildTab.md). `-1` is the previous root,
-`1` the next; it wraps at either end. Without nested tabs it behaves like
-[ActivateTabRelative](ActivateTabRelative.md).
+`1` the next; it stops at either end. Without nested tabs it behaves like
+[ActivateTabRelativeNoWrap](ActivateTabRelativeNoWrap.md).
 
 ```lua
 local act = wezterm.action

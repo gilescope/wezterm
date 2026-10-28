@@ -10,8 +10,9 @@ With the tab bar on the Left or Right, the side bar lists only root tabs; the
 active root's children (and the root itself) show in a row across the top of
 the panes, so a project tab can carry a few related shells, say an agent and a
 plain prompt in the same directory, that you flip between without leaving the
-side tab. The row is hidden while a root has no children. With a Top or
-Bottom bar a child is simply placed after its root.
+side tab. The row's `+` button opens a child with the mouse; the side
+bar's `+` opens a new root. With a Top or Bottom bar a child is simply placed
+after its root.
 
 Closing a root promotes its children to roots. Dragging a root in the side bar
 moves its children with it.

@@ -456,6 +456,31 @@ impl crate::TermWindow {
         };
         computed.translate(euclid::vec2(translate_x, 0.));
 
+        // More tabs than fit: slide the column (not the bar background) so
+        // the active tab is in view. Tabs pushed above the top just draw
+        // off-screen; the wheel and the keys walk through them.
+        let avail = self.dimensions.pixel_height as f32 - (border.top + border.bottom).get() as f32;
+        let active_bottom = computed
+            .ui_items()
+            .into_iter()
+            .find(|item| {
+                matches!(
+                    item.item_type,
+                    UIItemType::TabBar(TabBarItem::Tab { active: true, .. })
+                )
+            })
+            .map(|item| (item.y + item.height) as f32 + metrics.cell_size.height as f32 * 0.5);
+        if let Some(bottom) = active_bottom {
+            let overflow = bottom - avail;
+            if overflow > 0. {
+                if let ComputedElementContent::Children(kids) = &mut computed.content {
+                    for kid in kids {
+                        kid.translate(euclid::vec2(0., -overflow));
+                    }
+                }
+            }
+        }
+
         Ok(computed)
     }
 

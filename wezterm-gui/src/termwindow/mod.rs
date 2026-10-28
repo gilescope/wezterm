@@ -2113,12 +2113,10 @@ impl TermWindow {
             if tab_pos.is_vertical() && !tabs.is_empty() {
                 let active_idx = tabs.iter().position(|t| t.is_active).unwrap_or(0);
                 let root = window.root_idx_of(active_idx);
+                // The row shows even for a lone root: its `+` is the mouse
+                // way to open a child tab.
                 let block = root..window.children_of(root).end;
-                let row = if block.len() > 1 {
-                    tabs[block.clone()].to_vec()
-                } else {
-                    vec![]
-                };
+                let row = tabs[block.clone()].to_vec();
                 let roots = window
                     .root_indices()
                     .into_iter()
@@ -2528,7 +2526,7 @@ impl TermWindow {
         Ok(())
     }
 
-    /// Cycle through root tabs only, wrapping at either end.
+    /// Step through root tabs only, stopping at either end.
     fn activate_root_relative(&mut self, delta: isize) -> anyhow::Result<()> {
         let mux = Mux::get();
         let window = mux
@@ -2537,9 +2535,8 @@ impl TermWindow {
         let roots = window.root_indices();
         ensure!(!roots.is_empty(), "no more tabs");
         let active_root = window.root_idx_of(window.get_active_tab_idx());
-        let r = roots.iter().position(|&i| i == active_root).unwrap_or(0) as isize;
-        let n = roots.len() as isize;
-        let target = roots[((r + delta) % n + n) as usize % roots.len()];
+        let r = roots.iter().position(|&i| i == active_root).unwrap_or(0);
+        let target = roots[r.saturating_add_signed(delta).min(roots.len() - 1)];
         drop(window);
         self.activate_tab(target as isize)
     }

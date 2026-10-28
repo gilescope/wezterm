@@ -830,6 +830,14 @@ impl TerminalState {
         &mut self.screen
     }
 
+    /// Seed the primary screen's scrollback (session restore). Goes to the
+    /// primary screen even while the alternate screen is active.
+    pub fn prepend_scrollback(&mut self, lines: Vec<Line>) {
+        self.increment_seqno();
+        let seqno = self.seqno;
+        self.screen.screen.prepend_scrollback(lines, seqno);
+    }
+
     fn set_clipboard_contents(
         &self,
         selection: ClipboardSelection,

@@ -302,6 +302,20 @@ impl UserData for MuxPane {
             }
         });
 
+        methods.add_method("save_scrollback", |_, this, path: String| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            pane.save_scrollback(std::path::Path::new(&path))
+                .map_err(|e| mlua::Error::external(format!("{:#}", e)))
+        });
+
+        methods.add_method("load_scrollback", |_, this, path: String| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            pane.load_scrollback(std::path::Path::new(&path))
+                .map_err(|e| mlua::Error::external(format!("{:#}", e)))
+        });
+
         methods.add_method("inject_output", |_, this, text: String| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;

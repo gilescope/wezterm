@@ -4,6 +4,7 @@ use crate::pane::{
     SearchResult, WithPaneLines,
 };
 use crate::renderable::*;
+use crate::scrollback::SavedScrollback;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
 use crate::{Domain, Mux, MuxNotification};
 use anyhow::Error;
@@ -21,19 +22,20 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::escape::csi::{Sgr, CSI};
 use termwiz::escape::{Action, DeviceControlMode};
 use termwiz::input::KeyboardEncoding;
-use termwiz::surface::{Line, SequenceNo};
+use termwiz::surface::{Line, SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent,
-    ProgramStatus, Progress, SemanticZone, StableRowIndex, Terminal, TerminalConfiguration,
-    TerminalSize,
+    Alert, AlertHandler, CellAttributes, Clipboard, DownloadHandler, Intensity, KeyCode,
+    KeyModifiers, MouseEvent, ProgramStatus, Progress, SemanticZone, StableRowIndex, Terminal,
+    TerminalConfiguration, TerminalSize,
 };
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
@@ -134,6 +136,9 @@ pub struct LocalPane {
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
+    /// seqno and time of the last scrollback save, so a busy pane is not
+    /// re-serialised on every status tick.
+    scrollback_save: Mutex<(SequenceNo, Option<Instant>)>,
 }
 
 #[async_trait(?Send)]
@@ -500,6 +505,60 @@ impl Pane for LocalPane {
 
     fn has_unseen_command_result(&self) -> bool {
         self.terminal.lock().has_unseen_command_result()
+    }
+
+    fn save_scrollback(&self, path: &Path) -> anyhow::Result<bool> {
+        // Losing the last few seconds on a crash beats serialising a busy
+        // pane's history once a second.
+        const MIN_INTERVAL: Duration = Duration::from_secs(5);
+        let mut state = self.scrollback_save.lock();
+        let (cols, mut lines) = {
+            let terminal = self.terminal.lock();
+            if terminal.is_alt_screen_active() {
+                return Ok(false);
+            }
+            let seqno = terminal.current_seqno();
+            if state.0 == seqno {
+                return Ok(false);
+            }
+            if state.1.is_some_and(|at| at.elapsed() < MIN_INTERVAL) {
+                return Ok(false);
+            }
+            state.0 = seqno;
+            let screen = terminal.screen();
+            (
+                screen.physical_cols,
+                screen.lines_in_phys_range(0..screen.scrollback_rows()),
+            )
+        };
+        // The blank rows at the bottom are the empty viewport, not history.
+        while lines.last().is_some_and(Line::is_whitespace) {
+            lines.pop();
+        }
+        SavedScrollback::new(cols, lines).save(path)?;
+        state.1 = Some(Instant::now());
+        Ok(true)
+    }
+
+    fn load_scrollback(&self, path: &Path) -> anyhow::Result<usize> {
+        let saved = SavedScrollback::load(path)?;
+        let restored = saved.lines.len();
+        let mut lines = saved.lines;
+        // A dim rule marks where the previous session ended.
+        let dim = CellAttributes::default()
+            .set_intensity(Intensity::Half)
+            .clone();
+        lines.push(Line::from_text(
+            "\u{2500}\u{2500} restored \u{2500}\u{2500}",
+            &dim,
+            SEQ_ZERO,
+            None,
+        ));
+        self.terminal.lock().prepend_scrollback(lines);
+        if let Some(mux) = Mux::try_get() {
+            mux.notify(MuxNotification::PaneOutput(self.pane_id));
+        }
+        Ok(restored)
     }
 
     fn is_mouse_grabbed(&self) -> bool {
@@ -1046,6 +1105,7 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
+            scrollback_save: Mutex::new((0, None)),
         }
     }
 

@@ -27,6 +27,9 @@ As features stabilize some brief notes about them will accumulate here.
   done or failed; see [pane:get_program_status()](config/lua/pane/get_program_status.md).
   OSC 133 `D` now feeds [pane:has_unseen_command_result()](config/lua/pane/has_unseen_command_result.md),
   a finished-command signal that prompt redraws do not trip.
+* Scrollback can survive a restart: [pane:save_scrollback()](config/lua/pane/save_scrollback.md)
+  and [pane:load_scrollback()](config/lua/pane/load_scrollback.md) write and
+  reseed a pane's history, for use from `update-status` and `gui-startup`.
 * Nested tabs: [SpawnChildTab](config/lua/keyassignment/SpawnChildTab.md)
   opens a tab under the current tab's root. With a Left/Right tab bar the
   side bar lists roots and the active root's children appear in a row across

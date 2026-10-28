@@ -1615,3 +1615,41 @@ fn command_finished_since_focus_lost() {
     term.term.focus_changed(true);
     assert!(!term.term.has_unseen_command_result());
 }
+
+fn texts(lines: &[Line]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| l.as_str().trim_end().to_string())
+        .collect()
+}
+
+/// Restored scrollback goes above the (blank) viewport, lines wider than
+/// the screen are wrapped, and the scrollback cap is honoured by dropping
+/// the oldest lines.
+#[test]
+fn prepend_scrollback_seeds_history() {
+    let mut term = TestTerm::new(3, 10, 100);
+    let attrs = CellAttributes::default();
+    term.term.prepend_scrollback(vec![
+        Line::from_text("hello", &attrs, SEQ_ZERO, None),
+        Line::from_text("a line that wraps", &attrs, SEQ_ZERO, None),
+    ]);
+    let all = term.screen().all_lines();
+    assert_eq!(
+        texts(&all),
+        vec!["hello", "a line tha", "t wraps", "", "", ""]
+    );
+    assert!(all[1].last_cell_was_wrapped());
+    assert_eq!(term.screen().scrollback_rows(), 6);
+
+    let mut small = TestTerm::new(3, 10, 1);
+    small.term.prepend_scrollback(vec![
+        Line::from_text("one", &attrs, SEQ_ZERO, None),
+        Line::from_text("two", &attrs, SEQ_ZERO, None),
+        Line::from_text("three", &attrs, SEQ_ZERO, None),
+    ]);
+    assert_eq!(
+        texts(&small.screen().all_lines()),
+        vec!["three", "", "", ""]
+    );
+}

@@ -293,6 +293,19 @@ pub trait Pane: Downcast + Send + Sync {
         false
     }
 
+    /// Save the primary screen's lines to `path` for session restore.
+    /// Returns false when there was nothing new to save (unchanged since the
+    /// last save, saved very recently, or the alternate screen is active).
+    fn save_scrollback(&self, _path: &std::path::Path) -> anyhow::Result<bool> {
+        anyhow::bail!("scrollback save is not supported for this pane")
+    }
+
+    /// Seed this pane's scrollback from a file written by `save_scrollback`,
+    /// above whatever it holds now. Returns the number of lines restored.
+    fn load_scrollback(&self, _path: &std::path::Path) -> anyhow::Result<usize> {
+        anyhow::bail!("scrollback restore is not supported for this pane")
+    }
+
     /// Certain panes are OK to be closed with impunity (no prompts)
     fn can_close_without_prompting(&self, _reason: CloseReason) -> bool {
         false

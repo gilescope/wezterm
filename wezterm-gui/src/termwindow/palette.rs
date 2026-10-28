@@ -258,7 +258,8 @@ impl CommandPalette {
             .fonts
             .command_palette_font()
             .expect("to resolve command palette font");
-        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics())
+            .scale_line_height(term_window.config.command_palette_line_height);
 
         let tab_pos = term_window.resolved_tab_bar_position();
         let top_bar_height = if term_window.show_tab_bar && tab_pos == config::TabBarPosition::Top {
@@ -668,7 +669,8 @@ impl Modal for CommandPalette {
             .fonts
             .command_palette_font()
             .expect("to resolve char selection font");
-        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics())
+            .scale_line_height(term_window.config.command_palette_line_height);
 
         let mut max_rows_on_screen = ((term_window.dimensions.pixel_height * 8 / 10)
             / metrics.cell_size.height as usize)

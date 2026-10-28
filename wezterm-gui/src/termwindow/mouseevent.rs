@@ -3,7 +3,7 @@ use crate::termwindow::{
     GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
-    MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
+    CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
     WindowDecorations, WindowOps, WindowState,
 };
 use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
@@ -261,7 +261,7 @@ impl super::TermWindow {
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
         self.current_mouse_event = None;
         self.update_title();
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
         context.invalidate();
     }
 
@@ -364,7 +364,11 @@ impl super::TermWindow {
         // Project the pointer onto the axis the tab bar runs along: x for a
         // horizontal bar (Top/Bottom), y for a vertical bar (Left/Right).
         let vertical = self.config.resolved_tab_bar_position().is_vertical();
-        let current = if vertical { event.coords.y } else { event.coords.x };
+        let current = if vertical {
+            event.coords.y
+        } else {
+            event.coords.x
+        };
         let start = if vertical {
             start_event.coords.y
         } else {
@@ -466,7 +470,7 @@ impl super::TermWindow {
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        context.set_cursor(Some(CursorIcon::EwResize));
         if event.kind == WMEK::Press(MousePress::Left) {
             self.dragging.replace((item, event));
         }
@@ -474,12 +478,7 @@ impl super::TermWindow {
 
     /// Resize the vertical tab bar by dragging its inner-edge separator.
     /// Updates the runtime width override and re-lays-out the terminal area.
-    fn drag_tab_bar_separator(
-        &mut self,
-        item: UIItem,
-        event: MouseEvent,
-        context: &dyn WindowOps,
-    ) {
+    fn drag_tab_bar_separator(&mut self, item: UIItem, event: MouseEvent, context: &dyn WindowOps) {
         let border = self.get_os_border();
         let mouse_x = event.coords.x as f32;
         let new_width = match self.resolved_tab_bar_position() {
@@ -524,7 +523,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     fn do_new_tab_button_click(&mut self, button: MousePress) {
@@ -661,9 +660,7 @@ impl super::TermWindow {
                 TabBarItem::None => {
                     self.show_tab_bar_position_picker();
                 }
-                TabBarItem::LeftStatus
-                | TabBarItem::RightStatus
-                | TabBarItem::WindowButton(_) => {}
+                TabBarItem::LeftStatus | TabBarItem::RightStatus | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Move => match tab_bar_item {
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
@@ -691,7 +688,7 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_above_scroll_thumb(
@@ -716,7 +713,7 @@ impl super::TermWindow {
             );
             context.invalidate();
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_below_scroll_thumb(
@@ -741,7 +738,7 @@ impl super::TermWindow {
             );
             context.invalidate();
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_scroll_thumb(
@@ -756,7 +753,7 @@ impl super::TermWindow {
             // self.scroll_drag_start = Some(from_top);
             self.dragging = Some((item, event));
         }
-        context.set_cursor(Some(MouseCursor::Arrow));
+        context.set_cursor(Some(CursorIcon::Default));
     }
 
     pub fn mouse_event_split(
@@ -767,8 +764,8 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         context.set_cursor(Some(match &split.direction {
-            SplitDirection::Horizontal => MouseCursor::SizeLeftRight,
-            SplitDirection::Vertical => MouseCursor::SizeUpDown,
+            SplitDirection::Horizontal => CursorIcon::EwResize,
+            SplitDirection::Vertical => CursorIcon::NsResize,
         }));
 
         if event.kind == WMEK::Press(MousePress::Left) {
@@ -967,11 +964,11 @@ impl super::TermWindow {
         context.set_cursor(Some(if self.current_highlight.is_some() {
             // When hovering over a hyperlink, show an appropriate
             // mouse cursor to give the cue that it is clickable
-            MouseCursor::Hand
+            CursorIcon::Pointer
         } else if pane.is_mouse_grabbed() || outside_window {
-            MouseCursor::Arrow
+            CursorIcon::Default
         } else {
-            MouseCursor::Text
+            CursorIcon::Text
         }));
 
         let event_trigger_type = match &event.kind {

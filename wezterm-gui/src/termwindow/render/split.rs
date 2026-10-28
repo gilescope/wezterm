@@ -17,18 +17,9 @@ impl crate::TermWindow {
         let cell_height = self.render_metrics.cell_size.height as f32;
 
         let border = self.get_os_border();
-        let tab_pos = self.resolved_tab_bar_position();
-        let first_row_offset = if self.show_tab_bar && tab_pos == config::TabBarPosition::Top {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.
-        } + border.top.get() as f32;
-
-        let left_bar_offset = if self.show_tab_bar && tab_pos == config::TabBarPosition::Left {
-            self.tab_bar_pixel_width()
-        } else {
-            0.
-        };
+        let (top_bar_height, _) = self.horizontal_bar_heights();
+        let first_row_offset = top_bar_height + border.top.get() as f32;
+        let left_bar_offset = self.left_bar_width();
 
         let (padding_left, padding_top) = self.padding_left_top();
 

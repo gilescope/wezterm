@@ -70,19 +70,12 @@ impl super::TermWindow {
         self.current_mouse_event.replace(event.clone());
 
         let border = self.get_os_border();
-        let tab_pos = self.resolved_tab_bar_position();
 
-        let first_line_offset = if self.show_tab_bar && tab_pos == config::TabBarPosition::Top {
-            self.tab_bar_pixel_height().unwrap_or(0.) as isize
-        } else {
-            0
-        } + border.top.get() as isize;
-
-        let left_bar_offset = if self.show_tab_bar && tab_pos == config::TabBarPosition::Left {
-            self.tab_bar_pixel_width() as isize
-        } else {
-            0
-        };
+        // Both bars can be present at once (side bar + child row), so take
+        // the insets from the same helpers the renderer lays panes out with.
+        let (top_bar_height, _) = self.horizontal_bar_heights();
+        let first_line_offset = top_bar_height as isize + border.top.get() as isize;
+        let left_bar_offset = self.left_bar_width() as isize;
 
         let (padding_left, padding_top) = self.padding_left_top();
 

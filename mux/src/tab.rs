@@ -704,6 +704,11 @@ impl Tab {
     }
 
     pub fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
+        // A child tab is scratch space beside its root, so closing just it
+        // skips the prompt; a window close still kills its process and asks.
+        if reason == CloseReason::Tab && self.get_parent().is_some() {
+            return true;
+        }
         self.inner.lock().can_close_without_prompting(reason)
     }
 
@@ -2233,6 +2238,8 @@ mod test {
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
+        /// Mimics a pane running a process the user would not want killed.
+        stateful: bool,
     }
 
     impl FakePane {
@@ -2240,6 +2247,15 @@ mod test {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),
+                stateful: false,
+            })
+        }
+
+        fn stateful(id: PaneId, size: TerminalSize) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                stateful: true,
             })
         }
     }
@@ -2247,6 +2263,10 @@ mod test {
     impl Pane for FakePane {
         fn pane_id(&self) -> PaneId {
             self.id
+        }
+
+        fn can_close_without_prompting(&self, _reason: CloseReason) -> bool {
+            !self.stateful
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
@@ -2547,5 +2567,18 @@ mod test {
     #[test]
     fn tab_is_send_and_sync() {
         assert!(is_send_and_sync::<Tab>());
+    }
+
+    #[test]
+    fn child_tab_closes_without_prompting() {
+        let size = TerminalSize::default();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::stateful(1, size));
+        assert!(!tab.can_close_without_prompting(CloseReason::Tab));
+
+        tab.set_parent(Some(99));
+        assert!(tab.can_close_without_prompting(CloseReason::Tab));
+        // Closing the window still kills the child's process: keep that prompt.
+        assert!(!tab.can_close_without_prompting(CloseReason::Window));
     }
 }

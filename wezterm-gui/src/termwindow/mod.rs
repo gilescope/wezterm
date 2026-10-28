@@ -67,7 +67,9 @@ use wezterm_dynamic::Value;
 use wezterm_font::FontConfiguration;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
-use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
+use wezterm_term::{
+    Alert, ProgramStatus, Progress, StableRowIndex, TerminalConfiguration, TerminalSize,
+};
 
 pub mod background;
 pub mod box_model;
@@ -276,6 +278,13 @@ pub struct PaneInformation {
     pub title: String,
     pub user_vars: HashMap<String, String>,
     pub progress: Progress,
+    /// OSC 7501 summary, if the program in the pane reports one.
+    pub program_status: Option<ProgramStatus>,
+    /// A command finished (OSC 133 D) since the pane lost focus.
+    pub has_unseen_command_result: bool,
+    /// Current frame of the built-in activity spinner, phased per pane, so
+    /// a `format-tab-title` callback can animate without its own clock.
+    pub spinner: char,
 }
 
 impl UserData for PaneInformation {
@@ -292,6 +301,13 @@ impl UserData for PaneInformation {
         fields.add_field_method_get("pixel_width", |_, this| Ok(this.pixel_width));
         fields.add_field_method_get("pixel_height", |_, this| Ok(this.pixel_height));
         fields.add_field_method_get("progress", |lua, this| lua.to_value(&this.progress));
+        fields.add_field_method_get("program_status", |lua, this| {
+            lua.to_value(&this.program_status)
+        });
+        fields.add_field_method_get("has_unseen_command_result", |_, this| {
+            Ok(this.has_unseen_command_result)
+        });
+        fields.add_field_method_get("spinner", |_, this| Ok(this.spinner.to_string()));
         fields.add_field_method_get("title", |_, this| Ok(this.title.clone()));
         fields.add_field_method_get("user_vars", |_, this| Ok(this.user_vars.clone()));
         fields.add_field_method_get("foreground_process_name", |_, this| {
@@ -1253,7 +1269,9 @@ impl TermWindow {
                         | Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
                         | Alert::IconTitleChanged(_)
-                        | Alert::Progress(_),
+                        | Alert::Progress(_)
+                        | Alert::ProgramStatus(_)
+                        | Alert::CommandFinishedSinceFocusLost,
                     pane_id,
                 } => {
                     // Every GUI window subscribes to every pane's alerts;
@@ -1509,6 +1527,8 @@ impl TermWindow {
                     | Alert::TabTitleChanged(_)
                     | Alert::IconTitleChanged(_)
                     | Alert::Progress(_)
+                    | Alert::ProgramStatus(_)
+                    | Alert::CommandFinishedSinceFocusLost
                     | Alert::SetUserVar { .. }
                     | Alert::Bell,
             }
@@ -3634,6 +3654,9 @@ impl TermWindow {
             title: pos.pane.get_title(),
             user_vars: pos.pane.copy_user_vars(),
             progress: pos.pane.get_progress(),
+            program_status: pos.pane.get_program_status(),
+            has_unseen_command_result: pos.pane.has_unseen_command_result(),
+            spinner: crate::tabbar::spinner_glyph_for_pane(pos.pane.pane_id()),
         }
     }
 

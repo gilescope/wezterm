@@ -52,8 +52,262 @@ pub enum OperatingSystemCommand {
     ResetColors(Vec<u8>),
     RxvtExtension(Vec<String>),
     ConEmuProgress(Progress),
+    /// OSC 7501 Program Status Protocol report.
+    ProgramStatus(ProgramStatus),
+    /// `OSC 7501 ; ?`: the program asks whether the terminal implements
+    /// the Program Status Protocol. The terminal replies with
+    /// [ProgramStatus::QUERY_REPLY].
+    ProgramStatusQuery,
 
     Unspecified(Vec<Vec<u8>>),
+}
+
+/// The `state` of an OSC 7501 report. `Clear` is an action, not a state:
+/// it removes the record (and its children) instead of replacing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "use_serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "use_serde", serde(rename_all = "lowercase"))]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Error,
+    Clear,
+}
+
+impl ProgramState {
+    fn parse(v: &str) -> Option<Self> {
+        Some(match v {
+            "idle" => Self::Idle,
+            "working" => Self::Working,
+            "blocked" => Self::Blocked,
+            "done" => Self::Done,
+            "error" => Self::Error,
+            "clear" => Self::Clear,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Error => "error",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+/// Why a `Blocked` program is waiting on the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "use_serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "use_serde", serde(rename_all = "lowercase"))]
+pub enum BlockedKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+impl BlockedKind {
+    fn parse(v: &str) -> Option<Self> {
+        Some(match v {
+            "permission" => Self::Permission,
+            "question" => Self::Question,
+            "auth" => Self::Auth,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Auth => "auth",
+        }
+    }
+}
+
+/// One OSC 7501 report, revision 0.4 of
+/// <https://www.superlogical.com/rex/docs/build/program-status>.
+/// Each report replaces the record named by `id` wholesale, so a program
+/// repeats `app`/`title` in every report; a missing key here means the
+/// record no longer has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "use_serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProgramStatus {
+    pub state: ProgramState,
+    /// Record path; empty for the root record. `build/test` is a child of
+    /// `build` whether or not `build` has a record of its own.
+    pub id: Vec<String>,
+    /// Only meaningful with `Blocked`.
+    pub kind: Option<BlockedKind>,
+    /// 0-100, only with `Working`/`Blocked`; `None` is indeterminate.
+    pub progress: Option<u8>,
+    /// Stable program name such as `make`; not a display label.
+    pub app: Option<String>,
+    pub title: Option<String>,
+    pub msg: Option<String>,
+}
+
+impl ProgramStatus {
+    /// What a supporting terminal writes back for `OSC 7501 ; ?`.
+    pub const QUERY_REPLY: &'static str =
+        "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
+
+    const MAX_SEQUENCE: usize = 4096;
+    const MAX_ID_BYTES: usize = 128;
+    const MAX_ID_SEGMENTS: usize = 8;
+    const MAX_ID_SEGMENT: usize = 32;
+    const MAX_APP: usize = 32;
+    const MAX_TITLE_ENCODED: usize = 256;
+    const MAX_TITLE: usize = 192;
+    const MAX_MSG_ENCODED: usize = 2732;
+    const MAX_MSG: usize = 2048;
+
+    /// A `state=clear` for `id` (every record when `id` is empty).
+    pub fn clear(id: Vec<String>) -> Self {
+        Self {
+            state: ProgramState::Clear,
+            id,
+            kind: None,
+            progress: None,
+            app: None,
+            title: None,
+            msg: None,
+        }
+    }
+
+    fn value_byte_ok(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b"_.,+/=-".contains(&b)
+    }
+
+    fn app_byte_ok(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b"_.+-".contains(&b)
+    }
+
+    /// base64 (padding optional) to text with no control characters.
+    fn decode_text(v: &str, max_encoded: usize, max_decoded: usize) -> Result<String> {
+        use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+        ensure!(v.len() <= max_encoded, "7501 text too long");
+        let bytes = GeneralPurpose::new(
+            &base64::alphabet::STANDARD,
+            GeneralPurposeConfig::new()
+                .with_decode_allow_trailing_bits(true)
+                .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+        )
+        .decode(v)
+        .map_err(|err| format_err!("7501 base64: {:#}", err))?;
+        ensure!(bytes.len() <= max_decoded, "7501 text too long");
+        let text = String::from_utf8(bytes)?;
+        ensure!(
+            !text.chars().any(|c| c.is_control()),
+            "7501 text has control characters"
+        );
+        Ok(text)
+    }
+
+    fn parse_id(v: &str) -> Result<Vec<String>> {
+        ensure!(v.len() <= Self::MAX_ID_BYTES, "7501 id too long");
+        let segments: Vec<String> = v.split('/').map(|s| s.to_string()).collect();
+        ensure!(segments.len() <= Self::MAX_ID_SEGMENTS, "7501 id too deep");
+        ensure!(
+            segments
+                .iter()
+                .all(|s| !s.is_empty() && s.len() <= Self::MAX_ID_SEGMENT),
+            "7501 id segment invalid"
+        );
+        Ok(segments)
+    }
+
+    /// Lenient per pair (malformed or unknown pairs are skipped, last
+    /// duplicate wins), strict per report (a limit breach or bad text
+    /// discards the whole report, as does a missing or unknown state).
+    fn parse(payload: &[u8]) -> Result<Self> {
+        ensure!(
+            payload.len() <= Self::MAX_SEQUENCE,
+            "7501 sequence too long"
+        );
+        let payload = str::from_utf8(payload)?;
+        let mut state = None;
+        let mut id = vec![];
+        let mut kind = None;
+        let mut progress = None;
+        let mut app = None;
+        let mut title = None;
+        let mut msg = None;
+        for pair in payload.split(':') {
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty()
+                || !k.bytes().all(|b| b.is_ascii_lowercase())
+                || !v.bytes().all(Self::value_byte_ok)
+            {
+                continue;
+            }
+            match k {
+                "state" => state = ProgramState::parse(v),
+                "id" => id = Self::parse_id(v)?,
+                "kind" => kind = BlockedKind::parse(v),
+                "progress" => progress = v.parse::<u8>().ok().filter(|p| *p <= 100),
+                "app" => {
+                    ensure!(
+                        v.len() <= Self::MAX_APP && v.bytes().all(Self::app_byte_ok),
+                        "7501 app invalid"
+                    );
+                    app = Some(v.to_string());
+                }
+                "title" => {
+                    title = Some(Self::decode_text(
+                        v,
+                        Self::MAX_TITLE_ENCODED,
+                        Self::MAX_TITLE,
+                    )?)
+                }
+                "msg" => msg = Some(Self::decode_text(v, Self::MAX_MSG_ENCODED, Self::MAX_MSG)?),
+                _ => {}
+            }
+        }
+        let state = state.ok_or_else(|| format_err!("7501 report without a known state"))?;
+        Ok(Self {
+            state,
+            id,
+            kind,
+            progress,
+            app,
+            title,
+            msg,
+        })
+    }
+}
+
+impl Display for ProgramStatus {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(f, "state={}", self.state.as_str())?;
+        if !self.id.is_empty() {
+            write!(f, ":id={}", self.id.join("/"))?;
+        }
+        if let Some(kind) = self.kind {
+            write!(f, ":kind={}", kind.as_str())?;
+        }
+        if let Some(progress) = self.progress {
+            write!(f, ":progress={progress}")?;
+        }
+        if let Some(app) = &self.app {
+            write!(f, ":app={app}")?;
+        }
+        if let Some(title) = &self.title {
+            write!(f, ":title={}", base64_encode(title))?;
+        }
+        if let Some(msg) = &self.msg {
+            write!(f, ":msg={}", base64_encode(msg))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromPrimitive)]
@@ -363,6 +617,16 @@ impl OperatingSystemCommand {
             }
             FinalTermSemanticPrompt => self::FinalTermSemanticPrompt::parse(osc)
                 .map(OperatingSystemCommand::FinalTermSemanticPrompt),
+            ProgramStatus => {
+                // Values never contain `;` (base64 and the value byte set
+                // exclude it), so the report is exactly one parameter.
+                ensure!(osc.len() == 2, "7501 takes exactly one parameter");
+                if osc[1] == b"?" {
+                    Ok(OperatingSystemCommand::ProgramStatusQuery)
+                } else {
+                    self::ProgramStatus::parse(osc[1]).map(OperatingSystemCommand::ProgramStatus)
+                }
+            }
             ChangeColorNumber => Self::parse_change_color_number(osc),
             ResetColors => Self::parse_reset_colors(osc),
 
@@ -499,6 +763,8 @@ osc_entries!(
     RxvtProprietary = "777",
     FinalTermSemanticPrompt = "133",
     ITermProprietary = "1337",
+    /// Program Status Protocol, <https://www.superlogical.com/rex/docs/build/program-status>
+    ProgramStatus = "7501",
     /// Here the "Sun" suffix comes from the table in
     /// <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Miscellaneous>
     /// that lays out various window related escape sequences.
@@ -612,6 +878,8 @@ impl Display for OperatingSystemCommand {
             ConEmuProgress(Progress::SetError(pct)) => write!(f, "9;4;2;{pct}")?,
             ConEmuProgress(Progress::SetIndeterminate) => write!(f, "9;4;3")?,
             ConEmuProgress(Progress::Paused) => write!(f, "9;4;4")?,
+            ProgramStatus(status) => write!(f, "7501;{status}")?,
+            ProgramStatusQuery => write!(f, "7501;?")?,
         };
         // Use the longer form ST as neovim doesn't like the BEL version
         write!(f, "\x1b\\")?;
@@ -1723,6 +1991,123 @@ mod test {
                 "the tea is ready".into()
             ]),
         )
+    }
+
+    /// OSC 7501 Program Status Protocol, revision 0.4:
+    /// <https://www.superlogical.com/rex/docs/build/program-status>
+    #[test]
+    fn program_status_report() {
+        let msg = base64_encode("Apply 3 to add, 1 to change, 0 to destroy?");
+        let wire = format!("state=blocked:kind=permission:app=terraform:msg={msg}");
+        assert_eq!(
+            parse(&["7501", &wire], &format!("\x1b]7501;{wire}\x1b\\")),
+            OperatingSystemCommand::ProgramStatus(ProgramStatus {
+                state: ProgramState::Blocked,
+                id: vec![],
+                kind: Some(BlockedKind::Permission),
+                progress: None,
+                app: Some("terraform".into()),
+                title: None,
+                msg: Some("Apply 3 to add, 1 to change, 0 to destroy?".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn program_status_id_progress_title() {
+        let title = base64_encode("unit tests");
+        let wire = format!("state=working:id=build/test:progress=42:title={title}");
+        assert_eq!(
+            parse(&["7501", &wire], &format!("\x1b]7501;{wire}\x1b\\")),
+            OperatingSystemCommand::ProgramStatus(ProgramStatus {
+                state: ProgramState::Working,
+                id: vec!["build".into(), "test".into()],
+                kind: None,
+                progress: Some(42),
+                app: None,
+                title: Some("unit tests".into()),
+                msg: None,
+            })
+        );
+    }
+
+    #[test]
+    fn program_status_query_and_clear() {
+        assert_eq!(
+            parse(&["7501", "?"], "\x1b]7501;?\x1b\\"),
+            OperatingSystemCommand::ProgramStatusQuery
+        );
+        assert_eq!(
+            parse(&["7501", "state=clear"], "\x1b]7501;state=clear\x1b\\"),
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::clear(vec![]))
+        );
+    }
+
+    /// Lenient per pair, strict per report: a malformed pair, an unknown
+    /// key, surrounding whitespace, a bad progress and an unknown kind are
+    /// all skipped; the last duplicate wins.
+    #[test]
+    fn program_status_lenient_pairs() {
+        let wire = " state=idle : bogus : future=1 : kind=oracle : progress=200 : state=done ";
+        let osc = OperatingSystemCommand::parse(&[b"7501", wire.as_bytes()]);
+        assert_eq!(
+            osc,
+            OperatingSystemCommand::ProgramStatus(ProgramStatus {
+                state: ProgramState::Done,
+                id: vec![],
+                kind: None,
+                progress: None,
+                app: None,
+                title: None,
+                msg: None,
+            })
+        );
+    }
+
+    /// Whole-report discards: no/unknown state, undecodable base64, a
+    /// control character in decoded text, and limit breaches.
+    #[test]
+    fn program_status_discards() {
+        fn is_unspecified(wire: &str) -> bool {
+            matches!(
+                OperatingSystemCommand::parse(&[b"7501", wire.as_bytes()]),
+                OperatingSystemCommand::Unspecified(_)
+            )
+        }
+        assert!(is_unspecified("kind=question"));
+        assert!(is_unspecified("state=dancing"));
+        // `!` is outside the value byte set, so that pair is merely skipped;
+        // a value in the set that is not base64 discards the whole report.
+        assert!(!is_unspecified("state=done:msg=!!!"));
+        assert!(is_unspecified("state=done:msg=a"));
+        let tab = base64_encode("a\tb");
+        assert!(is_unspecified(&format!("state=done:msg={tab}")));
+        let long_title = base64_encode("x".repeat(193));
+        assert!(is_unspecified(&format!("state=done:title={long_title}")));
+        let deep_id = (0..9).map(|_| "a").collect::<Vec<_>>().join("/");
+        assert!(is_unspecified(&format!("state=done:id={deep_id}")));
+        let long_app = "a".repeat(33);
+        assert!(is_unspecified(&format!("state=done:app={long_app}")));
+        // `app` is a name, not a label: `,` is a legal value byte but not an app byte.
+        assert!(is_unspecified("state=done:app=make,clean"));
+    }
+
+    /// Unpadded base64 is accepted (the spec makes padding optional).
+    #[test]
+    fn program_status_unpadded_base64() {
+        let osc = OperatingSystemCommand::parse(&[b"7501", b"state=done:title=aGk"]);
+        assert_eq!(
+            osc,
+            OperatingSystemCommand::ProgramStatus(ProgramStatus {
+                state: ProgramState::Done,
+                id: vec![],
+                kind: None,
+                progress: None,
+                app: None,
+                title: Some("hi".into()),
+                msg: None,
+            })
+        );
     }
 
     #[test]

@@ -204,6 +204,18 @@ impl UserData for MuxPane {
             Ok(pane.has_unseen_output())
         });
 
+        methods.add_method("has_unseen_command_result", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            Ok(pane.has_unseen_command_result())
+        });
+
+        methods.add_method("get_program_status", |lua, this, _: ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            lua.to_value(&pane.get_program_status())
+        });
+
         methods.add_method("is_alt_screen_active", |_, this, _: ()| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;

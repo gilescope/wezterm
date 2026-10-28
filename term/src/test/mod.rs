@@ -1563,8 +1563,16 @@ fn program_status_query_reply() {
     let writer = CapturedWriter::default();
     let mut term = term_with_writer(writer.clone());
     term.advance_bytes("\x1b]7501;?\x1b\\");
-    let reply = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
-    assert_eq!(reply, ProgramStatus::QUERY_REPLY);
+    // The terminal writes replies from a helper thread (ThreadedWriter).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got = writer.0.lock().unwrap().clone();
+        if got.len() >= ProgramStatus::QUERY_REPLY.len() || std::time::Instant::now() > deadline {
+            assert_eq!(String::from_utf8(got).unwrap(), ProgramStatus::QUERY_REPLY);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Records are terminal state, not screen state: the alternate screen

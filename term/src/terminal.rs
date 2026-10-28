@@ -1,6 +1,7 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
 use std::sync::Arc;
+pub use wezterm_escape_parser::osc::{BlockedKind, ProgramState, ProgramStatus};
 use wezterm_escape_parser::parser::Parser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,13 @@ pub enum Alert {
     OutputSinceFocusLost,
     /// A change to the progress bar state
     Progress(Progress),
+    /// The OSC 7501 program-status summary changed (`None`: no records).
+    /// Carries the summary so remote panes need no second round-trip.
+    ProgramStatus(Option<ProgramStatus>),
+    /// A command finished (OSC 133 D) while the terminal was unfocused.
+    /// Raised once per focus loss, like `OutputSinceFocusLost`, but only
+    /// for a completed command rather than any output.
+    CommandFinishedSinceFocusLost,
 }
 
 pub trait AlertHandler: Send + Sync {

@@ -31,8 +31,9 @@ use url::Url;
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress,
-    SemanticZone, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize,
+    Alert, AlertHandler, Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent,
+    ProgramStatus, Progress, SemanticZone, StableRowIndex, Terminal, TerminalConfiguration,
+    TerminalSize,
 };
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
@@ -466,6 +467,10 @@ impl Pane for LocalPane {
         self.terminal.lock().get_progress()
     }
 
+    fn get_program_status(&self) -> Option<ProgramStatus> {
+        self.terminal.lock().program_status()
+    }
+
     fn palette(&self) -> ColorPalette {
         self.terminal.lock().palette()
     }
@@ -491,6 +496,10 @@ impl Pane for LocalPane {
 
     fn has_unseen_output(&self) -> bool {
         self.terminal.lock().has_unseen_output()
+    }
+
+    fn has_unseen_command_result(&self) -> bool {
+        self.terminal.lock().has_unseen_command_result()
     }
 
     fn is_mouse_grabbed(&self) -> bool {

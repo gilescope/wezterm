@@ -11,7 +11,7 @@ use termwiz::escape::parser::Parser;
 use termwiz::escape::{Action, ControlCode, CSI};
 use termwiz::surface::SEQ_ZERO;
 use termwiz_funcs::{format_as_escapes, FormatColor, FormatItem};
-use wezterm_term::{Line, Progress};
+use wezterm_term::{BlockedKind, Line, ProgramState, ProgramStatus, Progress};
 use window::{IntegratedTitleButton, IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +142,25 @@ fn title_text_from_lua(lua: &mlua::Lua, v: mlua::Value) -> anyhow::Result<Option
     }
 }
 
+/// The spinner frame for `pane_id` right now; exposed to Lua as
+/// `pane.spinner` so a custom title can animate a working pane.
+pub fn spinner_glyph_for_pane(pane_id: usize) -> char {
+    indeterminate_spinner_glyph(spinner_phase(pane_id))
+}
+
+/// Whether the pane's state is animated (a spinner frame is due).
+fn pane_is_animated(pane: &PaneInformation) -> bool {
+    matches!(pane.progress, Progress::Indeterminate)
+        || matches!(
+            &pane.program_status,
+            Some(ProgramStatus {
+                state: ProgramState::Working,
+                progress: None,
+                ..
+            })
+        )
+}
+
 /// pct is a percentage in the range 0-100.
 /// We want to map it to one of the nerdfonts:
 ///
@@ -240,7 +259,17 @@ fn compute_tab_titles(
         .into_iter()
         .zip(requests)
         .map(|(title, req)| {
-            title.unwrap_or_else(|| builtin_tab_title(&tab_info[req.tab_idx], config))
+            let tab = &tab_info[req.tab_idx];
+            match title {
+                Some(mut title) => {
+                    // The callback draws its own frames (via `pane.spinner`);
+                    // it still needs the bar rebuilt on the spinner grid.
+                    title.has_indeterminate =
+                        tab.active_pane.as_ref().is_some_and(pane_is_animated);
+                    title
+                }
+                None => builtin_tab_title(tab, config),
+            }
         })
         .collect()
 }
@@ -276,6 +305,79 @@ fn builtin_tab_title(tab: &TabInformation, config: &ConfigHandle) -> TitleText {
             items.push(FormatItem::Text(index));
 
             title = format!("{}{classic_spacing}", title);
+        }
+
+        // Program status (OSC 7501) outranks the progress bar: a blocked
+        // agent is the thing to look at, a working one gets the spinner.
+        let status_glyph = match &pane.program_status {
+            Some(ProgramStatus {
+                state: ProgramState::Blocked,
+                kind,
+                ..
+            }) => Some((
+                if *kind == Some(BlockedKind::Question) {
+                    "? "
+                } else {
+                    "\u{23f8}\u{fe0e} "
+                },
+                AnsiColor::Yellow,
+            )),
+            Some(ProgramStatus {
+                state: ProgramState::Error,
+                ..
+            }) => Some(("\u{2717} ", AnsiColor::Red)),
+            Some(ProgramStatus {
+                state: ProgramState::Done,
+                ..
+            }) => Some(("\u{25c8} ", AnsiColor::Green)),
+            Some(ProgramStatus {
+                state: ProgramState::Working,
+                progress: Some(pct),
+                ..
+            }) => {
+                let graphic = format!("{} ", pct_to_glyph(*pct));
+                len += unicode_column_width(&graphic, None);
+                items.push(FormatItem::Foreground(FormatColor::AnsiColor(
+                    AnsiColor::Green,
+                )));
+                items.push(FormatItem::Text(graphic));
+                items.push(FormatItem::Foreground(FormatColor::Default));
+                None
+            }
+            Some(ProgramStatus {
+                state: ProgramState::Working,
+                ..
+            }) => {
+                has_indeterminate = true;
+                let graphic = format!(
+                    "{} ",
+                    indeterminate_spinner_glyph(spinner_phase(tab.tab_id))
+                );
+                len += unicode_column_width(&graphic, None);
+                items.push(FormatItem::Foreground(FormatColor::AnsiColor(
+                    AnsiColor::Green,
+                )));
+                items.push(FormatItem::Text(graphic));
+                items.push(FormatItem::Foreground(FormatColor::Default));
+                None
+            }
+            Some(ProgramStatus {
+                state: ProgramState::Idle | ProgramState::Clear,
+                ..
+            })
+            | None => {
+                if pane.has_unseen_command_result && pane.program_status.is_none() {
+                    Some(("\u{25b8} ", AnsiColor::Green))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some((glyph, color)) = status_glyph {
+            len += unicode_column_width(glyph, None);
+            items.push(FormatItem::Foreground(FormatColor::AnsiColor(color)));
+            items.push(FormatItem::Text(glyph.to_string()));
+            items.push(FormatItem::Foreground(FormatColor::Default));
         }
 
         match pane.progress {
@@ -874,6 +976,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::Path;
+    use wezterm_term::{BlockedKind, ProgramState, ProgramStatus};
 
     fn pane(id: usize) -> PaneInformation {
         PaneInformation {
@@ -891,7 +994,74 @@ mod tests {
             title: format!("pane{id}"),
             user_vars: HashMap::new(),
             progress: Progress::None,
+            program_status: None,
+            has_unseen_command_result: false,
+            spinner: ' ',
         }
+    }
+
+    fn title_text(title: &TitleText) -> String {
+        title
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                FormatItem::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn builtin(pane: PaneInformation) -> TitleText {
+        config::use_test_configuration();
+        let tab = TabInformation {
+            tab_id: 0,
+            tab_index: 0,
+            is_active: false,
+            is_last_active: false,
+            active_pane: Some(pane),
+            window_id: 0,
+            tab_title: String::new(),
+        };
+        builtin_tab_title(&tab, &config::configuration())
+    }
+
+    /// Built-in title glyphs: blocked beats everything, then error, then a
+    /// working spinner (which must schedule frames), then the finished-
+    /// command marker for plain shells.
+    #[test]
+    fn builtin_title_shows_program_status() {
+        let mut p = pane(1);
+        p.program_status = Some(ProgramStatus {
+            state: ProgramState::Blocked,
+            id: vec![],
+            kind: Some(BlockedKind::Question),
+            progress: None,
+            app: Some("claude".into()),
+            title: None,
+            msg: None,
+        });
+        p.has_unseen_command_result = true;
+        let t = builtin(p.clone());
+        // The test config shows tab indices first, hence `contains`.
+        assert!(title_text(&t).contains("? pane1"), "{:?}", title_text(&t));
+        assert!(!t.has_indeterminate);
+
+        p.program_status.as_mut().unwrap().state = ProgramState::Working;
+        p.program_status.as_mut().unwrap().kind = None;
+        let t = builtin(p.clone());
+        assert!(t.has_indeterminate, "working drives the spinner timer");
+
+        p.program_status.as_mut().unwrap().state = ProgramState::Error;
+        let t = builtin(p.clone());
+        assert!(title_text(&t).contains("✗ pane1"), "{:?}", title_text(&t));
+
+        p.program_status = None;
+        let t = builtin(p.clone());
+        assert!(title_text(&t).contains("▸ pane1"), "{:?}", title_text(&t));
+
+        p.has_unseen_command_result = false;
+        let t = builtin(p);
+        assert!(title_text(&t).ends_with("pane1"), "{:?}", title_text(&t));
     }
 
     fn tabs(n: usize) -> (Vec<TabInformation>, Vec<PaneInformation>) {

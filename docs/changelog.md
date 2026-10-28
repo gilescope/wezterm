@@ -22,6 +22,13 @@ usually the best available version.
 As features stabilize some brief notes about them will accumulate here.
 
 #### Changed
+* Program Status Protocol (OSC 7501) is now supported: the tab bar shows
+  whether an agent such as Claude Code or Codex is working, blocked on you,
+  done or failed; see [pane:get_program_status()](config/lua/pane/get_program_status.md).
+  OSC 133 `D` now feeds [pane:has_unseen_command_result()](config/lua/pane/has_unseen_command_result.md),
+  a finished-command signal that prompt redraws do not trip.
+* Tab bar rebuilds are much cheaper with many tabs: `format-tab-title` runs
+  once per tab per rebuild, and unchanged OSC 0/2/7 reports no longer rebuild it.
 * fonts: Default dim/bold text now looks more contrasting, see #8049 for examples.
   Thanks to @bfoersterling (testing) & @hphng for his first OSS contribution! #8097
 * DECRQCRA is now disabled by default to prevent silent screen scraping.

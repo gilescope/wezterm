@@ -17,8 +17,8 @@ use url::Url;
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress, SemanticZone,
-    StableRowIndex, TerminalConfiguration, TerminalSize,
+    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, ProgramStatus, Progress,
+    SemanticZone, StableRowIndex, TerminalConfiguration, TerminalSize,
 };
 
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
@@ -240,6 +240,10 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_progress(&self) -> Progress {
         Progress::None
     }
+    /// OSC 7501 summary: what the program in this pane says it is doing.
+    fn get_program_status(&self) -> Option<ProgramStatus> {
+        None
+    }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
     fn send_composed_text(&self, text: &str) -> anyhow::Result<()> {
         self.writer().write_all(text.as_bytes())?;
@@ -281,6 +285,11 @@ pub trait Pane: Downcast + Send + Sync {
     fn advise_focus(&self) {}
 
     fn has_unseen_output(&self) -> bool {
+        false
+    }
+
+    /// A command finished (OSC 133 D) since the pane lost focus.
+    fn has_unseen_command_result(&self) -> bool {
         false
     }
 

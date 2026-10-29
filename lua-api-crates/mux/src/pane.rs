@@ -204,6 +204,21 @@ impl UserData for MuxPane {
             Ok(pane.has_unseen_output())
         });
 
+        methods.add_method("has_unseen_command_result", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            Ok(pane.has_unseen_command_result())
+        });
+
+        methods.add_method("get_program_status", |lua, this, _: ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            match pane.get_program_status() {
+                Some(status) => lua.to_value(&status),
+                None => Ok(mlua::Value::Nil),
+            }
+        });
+
         methods.add_method("is_alt_screen_active", |_, this, _: ()| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;
@@ -288,6 +303,20 @@ impl UserData for MuxPane {
                 Some(name) => Ok(name),
                 None => Ok("".to_string()),
             }
+        });
+
+        methods.add_method("save_scrollback", |_, this, path: String| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            pane.save_scrollback(std::path::Path::new(&path))
+                .map_err(|e| mlua::Error::external(format!("{:#}", e)))
+        });
+
+        methods.add_method("load_scrollback", |_, this, path: String| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            pane.load_scrollback(std::path::Path::new(&path))
+                .map_err(|e| mlua::Error::external(format!("{:#}", e)))
         });
 
         methods.add_method("inject_output", |_, this, text: String| {

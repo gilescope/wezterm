@@ -33,4 +33,22 @@ impl super::TermWindow {
             SpawnWhere::NewTab,
         );
     }
+
+    /// Spawn a tab under the current tab's root (the cwd follows the current
+    /// pane via the usual spawn path).
+    pub fn spawn_child_tab(&mut self, domain: &SpawnTabDomain) {
+        let mux = mux::Mux::get();
+        let parent = mux.get_window(self.mux_window_id).and_then(|window| {
+            let root = window.root_idx_of(window.get_active_tab_idx());
+            window.get_tab_at_idx(root).map(|tab| tab.tab_id())
+        });
+        self.spawn_command(
+            &SpawnCommand {
+                domain: domain.clone(),
+                parent_tab_id: parent,
+                ..Default::default()
+            },
+            SpawnWhere::NewTab,
+        );
+    }
 }

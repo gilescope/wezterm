@@ -22,6 +22,24 @@ usually the best available version.
 As features stabilize some brief notes about them will accumulate here.
 
 #### Changed
+* Program Status Protocol (OSC 7501) is now supported: the tab bar shows
+  whether an agent such as Claude Code or Codex is working, blocked on you,
+  done or failed; see [pane:get_program_status()](config/lua/pane/get_program_status.md).
+  OSC 133 `D` now feeds [pane:has_unseen_command_result()](config/lua/pane/has_unseen_command_result.md),
+  a finished-command signal that prompt redraws do not trip.
+* Scrollback can survive a restart: [pane:save_scrollback()](config/lua/pane/save_scrollback.md)
+  and [pane:load_scrollback()](config/lua/pane/load_scrollback.md) write and
+  reseed a pane's history, for use from `update-status` and `gui-startup`.
+* Tab search: [ShowTabSearch](config/lua/keyassignment/ShowTabSearch.md)
+  (`SUPER+SHIFT+f`, or the `⌕ search` box at the right of the tab bar) drops
+  down a fuzzy-matched list of the window's tabs to switch to.
+* Nested tabs: [SpawnChildTab](config/lua/keyassignment/SpawnChildTab.md)
+  opens a tab under the current tab's root. With a Left/Right tab bar the
+  side bar lists roots and the active root's children appear in a row across
+  the top. Also [ActivateRootRelative](config/lua/keyassignment/ActivateRootRelative.md),
+  `window:spawn_tab{parent_tab_id=}`, `tab:get_parent()`, `tab:set_parent()`.
+* Tab bar rebuilds are much cheaper with many tabs: `format-tab-title` runs
+  once per tab per rebuild, and unchanged OSC 0/2/7 reports no longer rebuild it.
 * fonts: Default dim/bold text now looks more contrasting, see #8049 for examples.
   Thanks to @bfoersterling (testing) & @hphng for his first OSS contribution! #8097
 * DECRQCRA is now disabled by default to prevent silent screen scraping.

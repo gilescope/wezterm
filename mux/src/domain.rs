@@ -334,6 +334,7 @@ impl LocalDomain {
                 set_environment_variables,
                 cwd,
                 position: None,
+                parent_tab_id: None,
             };
 
             let spawn_command = config::with_lua_config_on_main_thread(|lua| async {

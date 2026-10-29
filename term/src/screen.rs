@@ -760,6 +760,35 @@ impl Screen {
         }
     }
 
+    /// Seed history: put `lines` above everything currently held (the
+    /// blank viewport of a fresh terminal), wrapping any that are wider than
+    /// the screen and dropping the oldest beyond the scrollback cap. Meant
+    /// for session restore, before the pane has produced output of its own.
+    pub fn prepend_scrollback(&mut self, lines: Vec<Line>, seqno: SequenceNo) {
+        if !self.allow_scrollback {
+            return;
+        }
+        let mut restored = VecDeque::new();
+        for line in lines {
+            if line.len() <= self.physical_cols {
+                restored.push_back(line);
+            } else {
+                restored.extend(line.wrap(self.physical_cols, seqno));
+            }
+        }
+        for line in self.lines.drain(..) {
+            restored.push_back(line);
+        }
+        let capacity = self.physical_rows + self.scrollback_size();
+        while restored.len() > capacity {
+            restored.pop_front();
+        }
+        for line in &mut restored {
+            line.update_last_change_seqno(seqno);
+        }
+        self.lines = restored;
+    }
+
     pub fn erase_scrollback(&mut self) {
         let len = self.lines.len();
         let to_clear = len - self.physical_rows;

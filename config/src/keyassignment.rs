@@ -200,6 +200,11 @@ pub struct SpawnCommand {
     pub domain: SpawnTabDomain,
 
     pub position: Option<crate::GuiPosition>,
+
+    /// Nest the new tab under this root tab: with a vertical tab bar it
+    /// appears in the top row of that tab rather than as a new side tab.
+    #[dynamic(default)]
+    pub parent_tab_id: Option<usize>,
 }
 impl_lua_conversion_dynamic!(SpawnCommand);
 
@@ -263,6 +268,7 @@ impl SpawnCommand {
             args: if args.is_empty() { None } else { Some(args) },
             set_environment_variables,
             cwd,
+            parent_tab_id: None,
             position: None,
         })
     }
@@ -536,6 +542,10 @@ fn default_message() -> String {
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub enum KeyAssignment {
     SpawnTab(SpawnTabDomain),
+    /// Spawn a tab nested under the current tab's root, in the same cwd.
+    SpawnChildTab(SpawnTabDomain),
+    /// Cycle through root (side-bar) tabs, skipping their children.
+    ActivateRootRelative(isize),
     SpawnWindow,
     ToggleFullScreen,
     ToggleAlwaysOnTop,
@@ -574,6 +584,7 @@ pub enum KeyAssignment {
     ScrollToTop,
     ScrollToBottom,
     ShowTabNavigator,
+    ShowTabSearch,
     ShowDebugOverlay,
     HideApplication,
     QuitApplication,

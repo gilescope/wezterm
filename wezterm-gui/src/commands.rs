@@ -950,6 +950,49 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Shell"],
             icon: Some("md_tab_plus"),
         },
+        SpawnChildTab(SpawnTabDomain::CurrentPaneDomain) => CommandDef {
+            brief: "New Child Tab".into(),
+            doc: "Create a new tab nested under the current tab, in the same \
+            directory. With a vertical tab bar it appears in the top row."
+                .into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "t".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("md_tab_plus"),
+        },
+        SpawnChildTab(domain) => CommandDef {
+            brief: "New Child Tab (Other Domain)".into(),
+            doc: format!("Create a new child tab in the {domain:?} domain").into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_tab_plus"),
+        },
+        ActivateRootRelative(-1) => CommandDef {
+            brief: "Activate the side tab above".into(),
+            doc: "Activates the previous root tab, skipping child tabs".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window", "Select Tab"],
+            icon: None,
+        },
+        ActivateRootRelative(1) => CommandDef {
+            brief: "Activate the side tab below".into(),
+            doc: "Activates the next root tab, skipping child tabs".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window", "Select Tab"],
+            icon: None,
+        },
+        ActivateRootRelative(n) => CommandDef {
+            brief: format!("Activate the side tab {n} away").into(),
+            doc: "Activates a root tab relative to the current one, skipping child tabs"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
         SpawnTab(SpawnTabDomain::DefaultDomain) => CommandDef {
             brief: "New Tab (Default Domain)".into(),
             doc: "Create a new tab in the default domain".into(),
@@ -1638,6 +1681,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window", "Select Tab"],
             icon: Some("cod_list_flat"),
         },
+        ShowTabSearch => CommandDef {
+            brief: "Search tabs".into(),
+            doc: "Type to fuzzy-match a tab by title, directory or program and switch to it".into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "f".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window", "Select Tab"],
+            icon: Some("cod_search"),
+        },
         DetachDomain(SpawnTabDomain::CurrentPaneDomain) => CommandDef {
             brief: "Detach the domain of the active pane".into(),
             doc: "Detaches (disconnects from) the domain of the active pane".into(),
@@ -2153,6 +2204,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateLastTab,
         ShowLauncher,
         ShowTabNavigator,
+        ShowTabSearch,
         // ----------------- Help
         OpenUri("https://wezterm.org/".to_string()),
         OpenUri("https://github.com/wezterm/wezterm/discussions/".to_string()),

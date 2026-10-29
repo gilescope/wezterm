@@ -178,6 +178,9 @@ where
                     .await?;
                 stream.flush().await.context("flushing PDU to client")?;
             }
+            Ok(Item::Notif(MuxNotification::TabParentChanged { .. })) => {
+                // Nested tabs are a local GUI arrangement; not relayed to clients.
+            }
             Ok(Item::Notif(MuxNotification::TabTitleChanged { tab_id, title })) => {
                 Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title })
                     .encode_async(&mut stream, 0)

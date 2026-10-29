@@ -1378,3 +1378,278 @@ fn test_hyperlinks() {
         Compare::TEXT | Compare::ATTRS,
     );
 }
+
+/// Collects every alert the terminal raises so tests can count them.
+#[derive(Default)]
+struct AlertSink(Arc<Mutex<Vec<Alert>>>);
+
+impl AlertHandler for AlertSink {
+    fn alert(&mut self, alert: Alert) {
+        self.0.lock().unwrap().push(alert);
+    }
+}
+
+fn count_alerts(sink: &Arc<Mutex<Vec<Alert>>>, pred: impl Fn(&Alert) -> bool) -> usize {
+    sink.lock().unwrap().iter().filter(|a| pred(a)).count()
+}
+
+/// A repeated OSC 0/2 carrying the same title must not re-alert: every
+/// alert costs a full tab-bar rebuild in the GUI.
+#[test]
+fn repeated_title_does_not_realert() {
+    let mut term = TestTerm::new(3, 10, 0);
+    let sink = AlertSink::default();
+    let alerts = Arc::clone(&sink.0);
+    term.term.set_notification_handler(Box::new(sink));
+
+    term.print("\x1b]2;shell\x1b\\");
+    term.print("\x1b]2;shell\x1b\\");
+    term.print("\x1b]0;shell\x1b\\");
+    term.print("\x1b]2;other\x1b\\");
+
+    assert_eq!(
+        count_alerts(&alerts, |a| matches!(a, Alert::WindowTitleChanged(_))),
+        2
+    );
+}
+
+/// Same for OSC 7: shells emit it on every prompt even when the cwd is unchanged.
+#[test]
+fn repeated_cwd_does_not_realert() {
+    let mut term = TestTerm::new(3, 10, 0);
+    let sink = AlertSink::default();
+    let alerts = Arc::clone(&sink.0);
+    term.term.set_notification_handler(Box::new(sink));
+
+    term.print("\x1b]7;file://host/tmp\x1b\\");
+    term.print("\x1b]7;file://host/tmp\x1b\\");
+    term.print("\x1b]7;file://host/var\x1b\\");
+
+    assert_eq!(
+        count_alerts(&alerts, |a| matches!(
+            a,
+            Alert::CurrentWorkingDirectoryChanged
+        )),
+        2
+    );
+}
+
+/// A pty writer the test can read back: captures replies the terminal
+/// sends to the program (DA1, OSC 7501 query replies).
+#[derive(Clone, Default)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn term_with_writer(writer: CapturedWriter) -> Terminal {
+    Terminal::new(
+        TerminalSize {
+            rows: 3,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 48,
+            dpi: 0,
+        },
+        Arc::new(TestTermConfig { scrollback: 0 }),
+        "WezTerm",
+        "O_o",
+        Box::new(writer),
+    )
+}
+
+fn status(term: &TestTerm) -> Option<ProgramStatus> {
+    term.term.program_status()
+}
+
+/// OSC 7501: a report replaces its record wholesale, keys omitted later
+/// are gone (programs repeat `app` in every report).
+#[test]
+fn program_status_report_replaces_record() {
+    let mut term = TestTerm::new(3, 10, 0);
+    assert_eq!(status(&term), None);
+
+    term.print("\x1b]7501;state=blocked:kind=permission:app=claude\x1b\\");
+    let s = status(&term).expect("record");
+    assert_eq!(s.state, ProgramState::Blocked);
+    assert_eq!(s.kind, Some(BlockedKind::Permission));
+    assert_eq!(s.app.as_deref(), Some("claude"));
+
+    term.print("\x1b]7501;state=working:progress=50\x1b\\");
+    let s = status(&term).expect("record");
+    assert_eq!(s.state, ProgramState::Working);
+    assert_eq!(s.kind, None);
+    assert_eq!(s.app, None);
+    assert_eq!(s.progress, Some(50));
+}
+
+/// The summary is the most urgent record: blocked > error > working >
+/// done > idle, whichever id holds it.
+#[test]
+fn program_status_summary_precedence() {
+    let mut term = TestTerm::new(3, 10, 0);
+    term.print("\x1b]7501;state=working:app=make\x1b\\");
+    term.print("\x1b]7501;state=blocked:kind=question:id=build/test\x1b\\");
+    let s = status(&term).expect("record");
+    assert_eq!(s.state, ProgramState::Blocked);
+    assert_eq!(s.id, vec!["build".to_string(), "test".to_string()]);
+    // A child without `app` inherits its nearest ancestor's.
+    assert_eq!(s.app.as_deref(), Some("make"));
+
+    term.print("\x1b]7501;state=clear:id=build\x1b\\");
+    assert_eq!(status(&term).unwrap().state, ProgramState::Working);
+    term.print("\x1b]7501;state=clear\x1b\\");
+    assert_eq!(status(&term), None);
+}
+
+/// `working`/`blocked`/`idle` records belong to the running command and
+/// go away when the shell draws a new prompt (OSC 133 A); `done`/`error`
+/// stay until replaced or cleared. RIS drops everything.
+#[test]
+fn program_status_lifetimes() {
+    let mut term = TestTerm::new(3, 10, 0);
+    term.print("\x1b]7501;state=working\x1b\\");
+    term.print("\x1b]133;A\x1b\\");
+    assert_eq!(status(&term), None);
+
+    term.print("\x1b]7501;state=done:app=cargo\x1b\\");
+    term.print("\x1b]133;A\x1b\\");
+    assert_eq!(status(&term).unwrap().state, ProgramState::Done);
+
+    term.print("\x1bc");
+    assert_eq!(status(&term), None);
+}
+
+/// Every change raises `Alert::ProgramStatus` with the new summary, so
+/// the mux/GUI never have to poll; an unchanged summary stays quiet.
+#[test]
+fn program_status_alerts_on_change() {
+    let mut term = TestTerm::new(3, 10, 0);
+    let sink = AlertSink::default();
+    let alerts = Arc::clone(&sink.0);
+    term.term.set_notification_handler(Box::new(sink));
+
+    term.print("\x1b]7501;state=working:app=claude\x1b\\");
+    term.print("\x1b]7501;state=working:app=claude\x1b\\");
+    term.print("\x1b]7501;state=done:app=claude\x1b\\");
+    term.print("\x1b]7501;state=clear\x1b\\");
+
+    let seen: Vec<Option<ProgramState>> = alerts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|a| match a {
+            Alert::ProgramStatus(s) => Some(s.as_ref().map(|s| s.state)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![Some(ProgramState::Working), Some(ProgramState::Done), None]
+    );
+}
+
+/// `OSC 7501 ; ?` gets the spec's reply; Claude Code only reports status
+/// to terminals that answer.
+#[test]
+fn program_status_query_reply() {
+    let writer = CapturedWriter::default();
+    let mut term = term_with_writer(writer.clone());
+    term.advance_bytes("\x1b]7501;?\x1b\\");
+    // The terminal writes replies from a helper thread (ThreadedWriter).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let got = writer.0.lock().unwrap().clone();
+        if got.len() >= ProgramStatus::QUERY_REPLY.len() || std::time::Instant::now() > deadline {
+            assert_eq!(String::from_utf8(got).unwrap(), ProgramStatus::QUERY_REPLY);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Records are terminal state, not screen state: the alternate screen
+/// does not hide or drop them.
+#[test]
+fn program_status_survives_alt_screen() {
+    let mut term = TestTerm::new(3, 10, 0);
+    term.print("\x1b]7501;state=working\x1b\\");
+    term.set_mode("?1049", true);
+    assert_eq!(status(&term).unwrap().state, ProgramState::Working);
+    term.set_mode("?1049", false);
+    assert_eq!(status(&term).unwrap().state, ProgramState::Working);
+}
+
+/// The unread fallback for plain shells: a command finished (OSC 133 D)
+/// while the pane was unfocused. Prompt redraws and spinner output do not
+/// count, unlike `has_unseen_output`.
+#[test]
+fn command_finished_since_focus_lost() {
+    let mut term = TestTerm::new(3, 10, 0);
+    let sink = AlertSink::default();
+    let alerts = Arc::clone(&sink.0);
+    term.term.set_notification_handler(Box::new(sink));
+
+    term.term.focus_changed(false);
+    term.print("spinner frame\r\n");
+    assert!(!term.term.has_unseen_command_result());
+
+    term.print("\x1b]133;D;0\x1b\\");
+    assert!(term.term.has_unseen_command_result());
+    term.print("\x1b]133;D;0\x1b\\");
+    assert_eq!(
+        count_alerts(&alerts, |a| matches!(
+            a,
+            Alert::CommandFinishedSinceFocusLost
+        )),
+        1
+    );
+
+    term.term.focus_changed(true);
+    assert!(!term.term.has_unseen_command_result());
+}
+
+fn texts(lines: &[Line]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| l.as_str().trim_end().to_string())
+        .collect()
+}
+
+/// Restored scrollback goes above the (blank) viewport, lines wider than
+/// the screen are wrapped, and the scrollback cap is honoured by dropping
+/// the oldest lines.
+#[test]
+fn prepend_scrollback_seeds_history() {
+    let mut term = TestTerm::new(3, 10, 100);
+    let attrs = CellAttributes::default();
+    term.term.prepend_scrollback(vec![
+        Line::from_text("hello", &attrs, SEQ_ZERO, None),
+        Line::from_text("a line that wraps", &attrs, SEQ_ZERO, None),
+    ]);
+    let all = term.screen().all_lines();
+    assert_eq!(
+        texts(&all),
+        vec!["hello", "a line tha", "t wraps", "", "", ""]
+    );
+    assert!(all[1].last_cell_was_wrapped());
+    assert_eq!(term.screen().scrollback_rows(), 6);
+
+    let mut small = TestTerm::new(3, 10, 1);
+    small.term.prepend_scrollback(vec![
+        Line::from_text("one", &attrs, SEQ_ZERO, None),
+        Line::from_text("two", &attrs, SEQ_ZERO, None),
+        Line::from_text("three", &attrs, SEQ_ZERO, None),
+    ]);
+    assert_eq!(
+        texts(&small.screen().all_lines()),
+        vec!["three", "", "", ""]
+    );
+}

@@ -17,8 +17,8 @@ use url::Url;
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress, SemanticZone,
-    StableRowIndex, TerminalConfiguration, TerminalSize,
+    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, ProgramStatus, Progress,
+    SemanticZone, StableRowIndex, TerminalConfiguration, TerminalSize,
 };
 
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
@@ -240,6 +240,10 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_progress(&self) -> Progress {
         Progress::None
     }
+    /// OSC 7501 summary: what the program in this pane says it is doing.
+    fn get_program_status(&self) -> Option<ProgramStatus> {
+        None
+    }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
     fn send_composed_text(&self, text: &str) -> anyhow::Result<()> {
         self.writer().write_all(text.as_bytes())?;
@@ -282,6 +286,24 @@ pub trait Pane: Downcast + Send + Sync {
 
     fn has_unseen_output(&self) -> bool {
         false
+    }
+
+    /// A command finished (OSC 133 D) since the pane lost focus.
+    fn has_unseen_command_result(&self) -> bool {
+        false
+    }
+
+    /// Save the primary screen's lines to `path` for session restore.
+    /// Returns false when there was nothing new to save (unchanged since the
+    /// last save, saved very recently, or the alternate screen is active).
+    fn save_scrollback(&self, _path: &std::path::Path) -> anyhow::Result<bool> {
+        anyhow::bail!("scrollback save is not supported for this pane")
+    }
+
+    /// Seed this pane's scrollback from a file written by `save_scrollback`,
+    /// above whatever it holds now. Returns the number of lines restored.
+    fn load_scrollback(&self, _path: &std::path::Path) -> anyhow::Result<usize> {
+        anyhow::bail!("scrollback restore is not supported for this pane")
     }
 
     /// Certain panes are OK to be closed with impunity (no prompts)

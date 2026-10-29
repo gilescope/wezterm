@@ -67,7 +67,9 @@ use wezterm_dynamic::Value;
 use wezterm_font::FontConfiguration;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
-use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
+use wezterm_term::{
+    Alert, ProgramStatus, Progress, StableRowIndex, TerminalConfiguration, TerminalSize,
+};
 
 pub mod background;
 pub mod box_model;
@@ -83,6 +85,7 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+pub mod tabsearch;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
@@ -163,6 +166,8 @@ pub enum UIItemType {
     /// Draggable handle on the inner edge of a vertical (Left/Right) tab bar,
     /// used to resize the tab bar width.
     TabBarSeparator,
+    /// A row of the tab search dropdown, by display position.
+    TabSearchRow(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,11 +225,14 @@ pub struct TabInformation {
     pub active_pane: Option<PaneInformation>,
     pub window_id: MuxWindowId,
     pub tab_title: String,
+    /// Root tab this one nests under, if any.
+    pub parent_tab_id: Option<TabId>,
 }
 
 impl UserData for TabInformation {
     fn add_fields<'lua, F: UserDataFields<'lua, Self>>(fields: &mut F) {
         fields.add_field_method_get("tab_id", |_, this| Ok(this.tab_id));
+        fields.add_field_method_get("parent_tab_id", |_, this| Ok(this.parent_tab_id));
         fields.add_field_method_get("tab_index", |_, this| Ok(this.tab_index));
         fields.add_field_method_get("is_active", |_, this| Ok(this.is_active));
         fields.add_field_method_get("is_last_active", |_, this| Ok(this.is_last_active));
@@ -276,6 +284,13 @@ pub struct PaneInformation {
     pub title: String,
     pub user_vars: HashMap<String, String>,
     pub progress: Progress,
+    /// OSC 7501 summary, if the program in the pane reports one.
+    pub program_status: Option<ProgramStatus>,
+    /// A command finished (OSC 133 D) since the pane lost focus.
+    pub has_unseen_command_result: bool,
+    /// Current frame of the built-in activity spinner, phased per pane, so
+    /// a `format-tab-title` callback can animate without its own clock.
+    pub spinner: char,
 }
 
 impl UserData for PaneInformation {
@@ -292,6 +307,18 @@ impl UserData for PaneInformation {
         fields.add_field_method_get("pixel_width", |_, this| Ok(this.pixel_width));
         fields.add_field_method_get("pixel_height", |_, this| Ok(this.pixel_height));
         fields.add_field_method_get("progress", |lua, this| lua.to_value(&this.progress));
+        fields.add_field_method_get("program_status", |lua, this| {
+            // serde's None would become mlua's `null` userdata; Lua code
+            // wants a plain nil it can test with `if s then`.
+            match &this.program_status {
+                Some(status) => lua.to_value(status),
+                None => Ok(mlua::Value::Nil),
+            }
+        });
+        fields.add_field_method_get("has_unseen_command_result", |_, this| {
+            Ok(this.has_unseen_command_result)
+        });
+        fields.add_field_method_get("spinner", |_, this| Ok(this.spinner.to_string()));
         fields.add_field_method_get("title", |_, this| Ok(this.title.clone()));
         fields.add_field_method_get("user_vars", |_, this| Ok(this.user_vars.clone()));
         fields.add_field_method_get("foreground_process_name", |_, this| {
@@ -383,6 +410,17 @@ pub struct TermWindow {
     /// Terminal dimensions
     terminal_size: TerminalSize,
     pub mux_window_id: MuxWindowId,
+    /// With a vertical tab bar: the top row holding the active root tab
+    /// and its children, shown only when it has children.
+    pub sub_tab_bar: TabBarState,
+    pub fancy_sub_tab_bar: Option<box_model::ComputedElement>,
+    pub show_sub_tab_bar: bool,
+    /// Set while rebuilding for a spinner frame: titles of unanimated tabs
+    /// and the window title are reused rather than recomputed through Lua.
+    animation_frame_rebuild: bool,
+    /// How far the vertical tab bar's column is scrolled, in pixels; kept
+    /// across rebuilds so the list only moves when the active tab leaves view.
+    pub tab_bar_scroll_offset: std::cell::Cell<f32>,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     /// `true` when the mux subscription must be unsubscribed from.
     /// This is done asynchronously to avoid races between mux events.
@@ -446,6 +484,9 @@ pub struct TermWindow {
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
 
     last_status_call: Instant,
+    /// Set while an alert-driven title rebuild is queued, so a burst of
+    /// alerts (one OSC 0 yields up to three) costs one rebuild.
+    title_update_pending: bool,
     cursor_blink_state: RefCell<ColorEase>,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
@@ -744,6 +785,11 @@ impl TermWindow {
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
             fancy_tab_bar: None,
+            sub_tab_bar: TabBarState::default(),
+            fancy_sub_tab_bar: None,
+            show_sub_tab_bar: false,
+            animation_frame_rebuild: false,
+            tab_bar_scroll_offset: std::cell::Cell::new(0.),
             tab_bar_width_override: None,
             tab_switch_anim: None,
             matrix_rain_palette: None,
@@ -789,6 +835,7 @@ impl TermWindow {
                 &config,
             )),
             last_status_call: Instant::now(),
+            title_update_pending: false,
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
                 config.cursor_blink_ease_in,
@@ -1237,18 +1284,28 @@ impl TermWindow {
                 } => {
                     self.emit_user_var_event(pane_id, name, value);
                 }
-                MuxNotification::WindowTitleChanged { .. }
-                | MuxNotification::Alert {
+                MuxNotification::WindowTitleChanged { window_id, .. } => {
+                    if window_id == self.mux_window_id {
+                        self.request_title_update();
+                    }
+                }
+                MuxNotification::Alert {
                     alert:
                         Alert::OutputSinceFocusLost
                         | Alert::CurrentWorkingDirectoryChanged
                         | Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
                         | Alert::IconTitleChanged(_)
-                        | Alert::Progress(_),
-                    ..
+                        | Alert::Progress(_)
+                        | Alert::ProgramStatus(_)
+                        | Alert::CommandFinishedSinceFocusLost,
+                    pane_id,
                 } => {
-                    self.update_title();
+                    // Every GUI window subscribes to every pane's alerts;
+                    // only the window holding the pane has a tab to redraw.
+                    if self.window_contains_pane(pane_id) {
+                        self.request_title_update();
+                    }
                 }
                 MuxNotification::Alert {
                     alert: Alert::PaletteChanged,
@@ -1341,7 +1398,8 @@ impl TermWindow {
                     // Also handled by wezterm-client
                     self.update_title_post_status();
                 }
-                MuxNotification::TabTitleChanged { .. } => {
+                MuxNotification::TabTitleChanged { .. }
+                | MuxNotification::TabParentChanged { .. } => {
                     self.update_title_post_status();
                 }
                 MuxNotification::PaneAdded(_)
@@ -1497,6 +1555,8 @@ impl TermWindow {
                     | Alert::TabTitleChanged(_)
                     | Alert::IconTitleChanged(_)
                     | Alert::Progress(_)
+                    | Alert::ProgramStatus(_)
+                    | Alert::CommandFinishedSinceFocusLost
                     | Alert::SetUserVar { .. }
                     | Alert::Bell,
             }
@@ -1538,7 +1598,8 @@ impl TermWindow {
                 return true;
             }
             MuxNotification::TabResized(tab_id)
-            | MuxNotification::TabTitleChanged { tab_id, .. } => {
+            | MuxNotification::TabTitleChanged { tab_id, .. }
+            | MuxNotification::TabParentChanged { tab_id, .. } => {
                 let mux = Mux::get();
                 if mux.window_containing_tab(tab_id) == Some(mux_window_id) {
                     // fall through
@@ -1930,6 +1991,26 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    /// Queue one `update_title` for after the current notification batch.
+    /// Alerts arrive in bursts (an OSC 0 raises WindowTitleChanged,
+    /// IconTitleChanged and the mux's own WindowTitleChanged); rebuilding
+    /// synchronously on each would run the whole Lua title path three times.
+    fn request_title_update(&mut self) {
+        if self.title_update_pending {
+            return;
+        }
+        self.title_update_pending = true;
+        if let Some(window) = self.window.as_ref() {
+            window.notify(TermWindowNotif::Apply(Box::new(|tw| {
+                tw.title_update_pending = false;
+                tw.update_title();
+            })));
+        } else {
+            self.title_update_pending = false;
+            self.update_title();
+        }
+    }
+
     fn window_contains_pane(&mut self, pane_id: PaneId) -> bool {
         let mux = Mux::get();
 
@@ -1990,6 +2071,14 @@ impl TermWindow {
         self.update_title_impl();
     }
 
+    /// Rebuild for the next spinner frame: 10 Hz while an agent is working,
+    /// so only the animated tabs go back through `format-tab-title`.
+    pub fn update_title_for_animation_frame(&mut self) {
+        self.animation_frame_rebuild = true;
+        self.update_title_impl();
+        self.animation_frame_rebuild = false;
+    }
+
     /// If the mouse is hovering a tab in the tab bar, return that tab's title
     /// for display in the OS window title. `None` when not hovering a tab.
     fn hovered_tab_title(&self, tabs: &[TabInformation]) -> Option<String> {
@@ -2023,6 +2112,39 @@ impl TermWindow {
         let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
         let tab_bar_width = self.tab_bar_pixel_width();
 
+        // A vertical bar lists root tabs; the active root's children (plus
+        // the root itself) go in a top row instead. Side-bar entries keep
+        // their mux index so clicks still resolve; the active root is the
+        // one whose block holds the active tab.
+        let (bar_tabs, row_tabs): (Vec<TabInformation>, Vec<TabInformation>) =
+            if tab_pos.is_vertical() && !tabs.is_empty() {
+                let active_idx = tabs.iter().position(|t| t.is_active).unwrap_or(0);
+                let root = window.root_idx_of(active_idx);
+                // The row shows even for a lone root: its `+` is the mouse
+                // way to open a child tab.
+                let block = root..window.children_of(root).end;
+                let row = tabs[block.clone()].to_vec();
+                let roots = window
+                    .root_indices()
+                    .into_iter()
+                    .map(|i| {
+                        let mut t = tabs[i].clone();
+                        t.is_active = i == root;
+                        t
+                    })
+                    .collect();
+                (roots, row)
+            } else {
+                (tabs.clone(), vec![])
+            };
+        let show_sub_tab_bar = !row_tabs.is_empty();
+        if show_sub_tab_bar != self.show_sub_tab_bar {
+            self.show_sub_tab_bar = show_sub_tab_bar;
+            // The row takes pane space, so relayout like a tab-bar show/hide.
+            self.show_tab_bar_changed();
+        }
+        let left_bar_width = self.left_bar_width();
+
         let hovering_in_tab_bar = match &self.current_mouse_event {
             Some(event) => {
                 if tab_pos.is_vertical() {
@@ -2050,10 +2172,11 @@ impl TermWindow {
             None => false,
         };
 
+        let cell_width = self.render_metrics.cell_size.width as usize;
         let tab_bar_cols = if tab_pos.is_vertical() {
-            (tab_bar_width as usize) / self.render_metrics.cell_size.width as usize
+            (tab_bar_width as usize) / cell_width
         } else {
-            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize
+            self.dimensions.pixel_width / cell_width
         };
 
         let new_tab_bar = TabBarState::new(
@@ -2063,12 +2186,13 @@ impl TermWindow {
             } else {
                 None
             },
-            &tabs,
+            &bar_tabs,
             &panes,
             self.config.resolved_palette.tab_bar.as_ref(),
             &self.config,
             &self.left_status,
             &self.right_status,
+            self.animation_frame_rebuild.then_some(&self.tab_bar),
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
@@ -2079,11 +2203,57 @@ impl TermWindow {
             }
         }
 
+        // The top row sits right of the side bar; hover x is in its own cells.
+        let row_x0 = border.left.get() as f32 + left_bar_width;
+        let row_width = (self.dimensions.pixel_width as f32
+            - left_bar_width
+            - (border.left + border.right).get() as f32)
+            .max(0.);
+        let hovering_in_row = show_sub_tab_bar
+            && self.current_mouse_event.as_ref().is_some_and(|event| {
+                let (x, y) = (event.coords.x as f32, event.coords.y as f32);
+                let y0 = border.top.get() as f32;
+                x >= row_x0 && x < row_x0 + row_width && y >= y0 && y < y0 + tab_bar_height
+            });
+        let new_sub_tab_bar = if show_sub_tab_bar {
+            TabBarState::new(
+                row_width as usize / cell_width,
+                hovering_in_row.then(|| {
+                    self.last_mouse_coords
+                        .0
+                        .saturating_sub(row_x0 as usize / cell_width)
+                }),
+                &row_tabs,
+                &panes,
+                self.config.resolved_palette.tab_bar.as_ref(),
+                &self.config,
+                "",
+                "",
+                self.animation_frame_rebuild.then_some(&self.sub_tab_bar),
+            )
+        } else {
+            TabBarState::default()
+        };
+        if new_sub_tab_bar != self.sub_tab_bar {
+            self.sub_tab_bar = new_sub_tab_bar;
+            self.invalidate_fancy_tab_bar();
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+
         let tabs_count = window.count_tabs();
         if tabs_count == 0 {
             return;
         }
         drop(window);
+
+        // A spinner frame does not change the window title; skip the Lua
+        // round-trip (it serialises the whole Config) on those.
+        if self.animation_frame_rebuild {
+            self.schedule_next_status_update();
+            return;
+        }
 
         let title = match config::run_immediate_with_lua_config(|lua| {
             if let Some(lua) = lua {
@@ -2157,10 +2327,17 @@ impl TermWindow {
             // to piggy back on the config reloading code for that, so that
             // is what we're doing.
             if show_tab_bar != self.show_tab_bar {
-                self.config_was_reloaded();
+                self.show_tab_bar_changed();
             }
         }
         self.schedule_next_status_update();
+    }
+
+    /// Relayout after a bar appeared or disappeared. Piggybacks on the
+    /// config-reload path, which already resizes everything for a new bar
+    /// geometry.
+    fn show_tab_bar_changed(&mut self) {
+        self.config_was_reloaded();
     }
 
     fn schedule_next_status_update(&mut self) {
@@ -2185,17 +2362,8 @@ impl TermWindow {
         if let Some(win) = self.window.as_ref() {
             let cursor = pos.pane.get_cursor_position();
             let top = pos.pane.get_dimensions().physical_top;
-            let tab_pos = self.resolved_tab_bar_position();
-            let tab_bar_height = if self.show_tab_bar && tab_pos == config::TabBarPosition::Top {
-                self.tab_bar_pixel_height().unwrap()
-            } else {
-                0.0
-            };
-            let left_bar_width = if self.show_tab_bar && tab_pos == config::TabBarPosition::Left {
-                self.tab_bar_pixel_width()
-            } else {
-                0.0
-            };
+            let (tab_bar_height, _) = self.horizontal_bar_heights();
+            let left_bar_width = self.left_bar_width();
             let (padding_left, padding_top) = self.padding_left_top();
 
             let r = Rect::new(
@@ -2351,15 +2519,33 @@ impl TermWindow {
 
         ensure!(tab_idx < max, "cannot move a tab out of range");
 
-        let tab = window.remove_tab_idx(active_tab_idx);
-        window.insert_tab_at_idx(tab_idx, &tab);
-        window.set_active_tab_idx_without_saving(tab_idx);
+        // A root carries its children and steps over whole blocks; a child
+        // stays within its block. The window keeps the active tab active.
+        let delta = tab_idx as isize - active_tab_idx as isize;
+        if window.move_tab_relative(active_tab_idx, delta).is_none() {
+            return Ok(());
+        }
 
         drop(window);
         self.update_title();
         self.update_scrollbar();
 
         Ok(())
+    }
+
+    /// Step through root tabs only, stopping at either end.
+    fn activate_root_relative(&mut self, delta: isize) -> anyhow::Result<()> {
+        let mux = Mux::get();
+        let window = mux
+            .get_window(self.mux_window_id)
+            .ok_or_else(|| anyhow!("no such window"))?;
+        let roots = window.root_indices();
+        ensure!(!roots.is_empty(), "no more tabs");
+        let active_root = window.root_idx_of(window.get_active_tab_idx());
+        let r = roots.iter().position(|&i| i == active_root).unwrap_or(0);
+        let target = roots[r.saturating_add_signed(delta).min(roots.len() - 1)];
+        drop(window);
+        self.activate_tab(target as isize)
     }
 
     fn show_input_selector(&mut self, args: &config::keyassignment::InputSelector) {
@@ -2453,6 +2639,12 @@ impl TermWindow {
         });
         self.assign_overlay(tab.tab_id(), overlay);
         promise::spawn::spawn(future).detach();
+    }
+
+    /// Dropdown under the bar's search box: type to fuzzy-match a tab.
+    pub fn show_tab_search(&mut self) {
+        let modal = tabsearch::TabSearch::new(self);
+        self.set_modal(Rc::new(modal));
     }
 
     fn show_tab_navigator(&mut self) {
@@ -2789,6 +2981,12 @@ impl TermWindow {
             SpawnTab(spawn_where) => {
                 self.spawn_tab(spawn_where);
             }
+            SpawnChildTab(spawn_where) => {
+                self.spawn_child_tab(spawn_where);
+            }
+            ActivateRootRelative(n) => {
+                self.activate_root_relative(*n)?;
+            }
             SpawnWindow => {
                 self.spawn_command(&SpawnCommand::default(), SpawnWhere::NewWindow);
             }
@@ -2925,6 +3123,7 @@ impl TermWindow {
             ScrollToTop => self.scroll_to_top(pane),
             ScrollToBottom => self.scroll_to_bottom(pane),
             ShowTabNavigator => self.show_tab_navigator(),
+            ShowTabSearch => self.show_tab_search(),
             ShowDebugOverlay => self.show_debug_overlay(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {
@@ -3602,6 +3801,9 @@ impl TermWindow {
             title: pos.pane.get_title(),
             user_vars: pos.pane.copy_user_vars(),
             progress: pos.pane.get_progress(),
+            program_status: pos.pane.get_program_status(),
+            has_unseen_command_result: pos.pane.has_unseen_command_result(),
+            spinner: crate::tabbar::spinner_glyph_for_pane(pos.pane.pane_id()),
         }
     }
 
@@ -3629,6 +3831,7 @@ impl TermWindow {
                         .unwrap_or(false),
                     window_id: self.mux_window_id,
                     tab_title: tab.get_title(),
+                    parent_tab_id: tab.get_parent(),
                     active_pane: panes
                         .iter()
                         .find(|p| p.is_active)

@@ -1,4 +1,4 @@
-use crate::terminal::{Alert, Progress};
+use crate::terminal::{Alert, ProgramStatus, Progress};
 use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
@@ -678,6 +678,7 @@ impl<'a> Performer<'a> {
             // character position of first line.
             Esc::Code(EscCode::FullReset) => {
                 let seqno = self.seqno;
+                self.clear_program_status();
                 self.pen = Default::default();
                 self.cursor = Default::default();
                 self.wrap_next = false;
@@ -754,17 +755,28 @@ impl<'a> Performer<'a> {
                     handler.alert(Alert::IconTitleChanged(title));
                 }
             }
+            // Prompts and TUIs re-send an unchanged title on every redraw;
+            // each alert costs the GUI a tab-bar rebuild, so only alert on a
+            // real change.
             OperatingSystemCommand::SetIconNameAndWindowTitle(title) => {
-                self.icon_title.take();
+                let icon_changed = self.icon_title.take().is_some();
+                let changed = self.title != title;
                 self.title = title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::WindowTitleChanged(title.clone()));
-                    handler.alert(Alert::IconTitleChanged(Some(title)));
+                    if changed {
+                        handler.alert(Alert::WindowTitleChanged(title.clone()));
+                    }
+                    if changed || icon_changed {
+                        handler.alert(Alert::IconTitleChanged(Some(title)));
+                    }
                 }
             }
 
             OperatingSystemCommand::SetWindowTitleSun(title)
             | OperatingSystemCommand::SetWindowTitle(title) => {
+                if self.title == title {
+                    return;
+                }
                 self.title = title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::WindowTitleChanged(title));
@@ -872,6 +884,7 @@ impl<'a> Performer<'a> {
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                self.drop_command_scoped_program_status();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::StartPrompt(_),
@@ -903,7 +916,10 @@ impl<'a> Performer<'a> {
 
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus { .. },
-            ) => {}
+            ) => {
+                // OSC 133 D: the command finished.
+                self.mark_command_finished();
+            }
 
             OperatingSystemCommand::SystemNotification(message) => {
                 if let Some(handler) = self.alert_handler.as_mut() {
@@ -938,7 +954,11 @@ impl<'a> Performer<'a> {
                 }
             }
             OperatingSystemCommand::CurrentWorkingDirectory(url) => {
-                self.current_dir = Url::parse(&url).ok();
+                let dir = Url::parse(&url).ok();
+                if self.current_dir == dir {
+                    return;
+                }
+                self.current_dir = dir;
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::CurrentWorkingDirectoryChanged);
                 }
@@ -1078,6 +1098,15 @@ impl<'a> Performer<'a> {
                 }
                 self.implicit_palette_reset_if_same_as_configured();
                 self.palette_did_change();
+            }
+            OperatingSystemCommand::ProgramStatus(status) => {
+                self.apply_program_status(status);
+            }
+            OperatingSystemCommand::ProgramStatusQuery => {
+                self.writer
+                    .write_all(ProgramStatus::QUERY_REPLY.as_bytes())
+                    .ok();
+                self.writer.flush().ok();
             }
             OperatingSystemCommand::ConEmuProgress(prog) => {
                 use wezterm_escape_parser::osc::Progress as TProg;

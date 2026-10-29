@@ -46,6 +46,9 @@ struct TabInner {
     zoomed: Option<Arc<dyn Pane>>,
     title: String,
     recency: Recency,
+    /// Root tab this one nests under in the window's tab bar (the "top
+    /// row" of a side bar). `None` for a root tab.
+    parent: Option<TabId>,
 }
 
 /// A Tab is a container of Panes
@@ -520,6 +523,25 @@ impl Tab {
         self.inner.lock().title.clone()
     }
 
+    pub fn get_parent(&self) -> Option<TabId> {
+        self.inner.lock().parent
+    }
+
+    /// Set (or clear) the root this tab nests under. Ordering within the
+    /// window is the window's job: see `Window::attach_tab_to_parent`.
+    pub fn set_parent(&self, parent: Option<TabId>) {
+        let mut inner = self.inner.lock();
+        if inner.parent != parent {
+            inner.parent = parent;
+            Mux::try_get().map(|mux| {
+                mux.notify(MuxNotification::TabParentChanged {
+                    tab_id: inner.id,
+                    parent,
+                })
+            });
+        }
+    }
+
     pub fn set_title(&self, title: &str) {
         let mut inner = self.inner.lock();
         if inner.title != title {
@@ -682,6 +704,11 @@ impl Tab {
     }
 
     pub fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
+        // A child tab is scratch space beside its root, so closing just it
+        // skips the prompt; a window close still kills its process and asks.
+        if reason == CloseReason::Tab && self.get_parent().is_some() {
+            return true;
+        }
         self.inner.lock().can_close_without_prompting(reason)
     }
 
@@ -764,6 +791,7 @@ impl TabInner {
             zoomed: None,
             title: String::new(),
             recency: Recency::default(),
+            parent: None,
         }
     }
 
@@ -2210,6 +2238,8 @@ mod test {
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
+        /// Mimics a pane running a process the user would not want killed.
+        stateful: bool,
     }
 
     impl FakePane {
@@ -2217,6 +2247,15 @@ mod test {
             Arc::new(Self {
                 id,
                 size: Mutex::new(size),
+                stateful: false,
+            })
+        }
+
+        fn stateful(id: PaneId, size: TerminalSize) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                stateful: true,
             })
         }
     }
@@ -2224,6 +2263,10 @@ mod test {
     impl Pane for FakePane {
         fn pane_id(&self) -> PaneId {
             self.id
+        }
+
+        fn can_close_without_prompting(&self, _reason: CloseReason) -> bool {
+            !self.stateful
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
@@ -2524,5 +2567,18 @@ mod test {
     #[test]
     fn tab_is_send_and_sync() {
         assert!(is_send_and_sync::<Tab>());
+    }
+
+    #[test]
+    fn child_tab_closes_without_prompting() {
+        let size = TerminalSize::default();
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::stateful(1, size));
+        assert!(!tab.can_close_without_prompting(CloseReason::Tab));
+
+        tab.set_parent(Some(99));
+        assert!(tab.can_close_without_prompting(CloseReason::Tab));
+        // Closing the window still kills the child's process: keep that prompt.
+        assert!(!tab.can_close_without_prompting(CloseReason::Window));
     }
 }

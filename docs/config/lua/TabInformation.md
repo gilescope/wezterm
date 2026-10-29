@@ -16,5 +16,6 @@ The `TabInformation` struct contains the following fields:
 * `window_id` - the ID of the window that contains this tab {{since('20220807-113146-c2fee766', inline=True)}}
 * `window_title` - the title of the window that contains this tab {{since('20220807-113146-c2fee766', inline=True)}}
 * `tab_title` - the title of the tab {{since('20220807-113146-c2fee766', inline=True)}}
+* `parent_tab_id` - the id of the root tab this tab is nested under, or `nil`; see [SpawnChildTab](keyassignment/SpawnChildTab.md) {{since('nightly', inline=True)}}
 
 

@@ -27,8 +27,8 @@ use url::Url;
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Alert, Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, Progress, StableRowIndex,
-    TerminalConfiguration, TerminalSize,
+    Alert, Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, ProgramStatus, Progress,
+    StableRowIndex, TerminalConfiguration, TerminalSize,
 };
 
 pub struct ClientPane {
@@ -50,6 +50,8 @@ pub struct ClientPane {
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
+    program_status: Mutex<Option<ProgramStatus>>,
+    unseen_command_result: Mutex<bool>,
 }
 
 impl ClientPane {
@@ -133,6 +135,8 @@ impl ClientPane {
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
+            program_status: Mutex::new(None),
+            unseen_command_result: Mutex::new(false),
         }
     }
 
@@ -201,6 +205,12 @@ impl ClientPane {
                             pane_id: self.local_pane_id,
                             alert: Alert::Progress(progress.clone()),
                         });
+                    }
+                    Alert::ProgramStatus(status) => {
+                        *self.program_status.lock() = status.clone();
+                    }
+                    Alert::CommandFinishedSinceFocusLost => {
+                        *self.unseen_command_result.lock() = true;
                     }
                     _ => {}
                 }
@@ -330,6 +340,10 @@ impl Pane for ClientPane {
 
     fn get_progress(&self) -> Progress {
         self.progress.lock().clone()
+    }
+
+    fn get_program_status(&self) -> Option<ProgramStatus> {
+        self.program_status.lock().clone()
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
@@ -560,6 +574,7 @@ impl Pane for ClientPane {
         if focused {
             self.advise_focus();
             *self.unseen_output.lock() = false;
+            *self.unseen_command_result.lock() = false;
         }
     }
 
@@ -598,6 +613,10 @@ impl Pane for ClientPane {
 
     fn has_unseen_output(&self) -> bool {
         *self.unseen_output.lock()
+    }
+
+    fn has_unseen_command_result(&self) -> bool {
+        *self.unseen_command_result.lock()
     }
 
     fn can_close_without_prompting(&self, reason: CloseReason) -> bool {

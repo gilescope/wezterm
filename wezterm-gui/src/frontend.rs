@@ -87,6 +87,7 @@ impl GuiFrontEnd {
                     .detach();
                 }
                 MuxNotification::TabTitleChanged { .. } => {}
+                MuxNotification::TabParentChanged { .. } => {}
                 MuxNotification::WindowTitleChanged { .. } => {}
                 MuxNotification::TabResized(_) => {}
                 MuxNotification::TabAddedToWindow { .. } => {}
@@ -134,7 +135,11 @@ impl GuiFrontEnd {
                 }
                 MuxNotification::Alert {
                     pane_id: _,
-                    alert: Alert::Bell | Alert::Progress(_),
+                    alert:
+                        Alert::Bell
+                        | Alert::Progress(_)
+                        | Alert::ProgramStatus(_)
+                        | Alert::CommandFinishedSinceFocusLost,
                 } => {
                     // Handled via TermWindowNotif; NOP it here.
                 }

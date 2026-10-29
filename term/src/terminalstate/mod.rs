@@ -7,7 +7,7 @@ use crate::color::{ColorPalette, RgbColor};
 use crate::config::{BidiMode, NewlineCanon};
 use log::debug;
 use num_traits::ToPrimitive;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{channel, Sender};
@@ -350,6 +350,17 @@ pub struct TerminalState {
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
     progress: Progress,
+    /// OSC 7501 records keyed by id path, with the seqno of their last
+    /// report for least-recently-updated eviction. Terminal state, not
+    /// screen state: the alternate screen does not touch it.
+    program_status: BTreeMap<Vec<String>, (ProgramStatus, SequenceNo)>,
+    /// Last summary handed to the alert handler, so an unchanged summary
+    /// stays quiet.
+    program_status_alerted: Option<ProgramStatus>,
+    /// seqno at the most recent OSC 133 D (command finished).
+    command_finished_seqno: SequenceNo,
+    /// seqno at which `CommandFinishedSinceFocusLost` was last raised.
+    command_finished_alerted_seqno: SequenceNo,
 
     palette: Option<ColorPalette>,
 
@@ -595,6 +606,10 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            program_status: BTreeMap::new(),
+            program_status_alerted: None,
+            command_finished_seqno: seqno,
+            command_finished_alerted_seqno: seqno,
         }
     }
 
@@ -660,6 +675,103 @@ impl TerminalState {
         self.progress.clone()
     }
 
+    /// The most urgent OSC 7501 record: blocked > error > working > done
+    /// > idle; ties go to the shallower id, then the newer report. A record
+    /// without `app` inherits its nearest ancestor's.
+    pub fn program_status(&self) -> Option<ProgramStatus> {
+        fn rank(state: ProgramState) -> u8 {
+            match state {
+                ProgramState::Blocked => 0,
+                ProgramState::Error => 1,
+                ProgramState::Working => 2,
+                ProgramState::Done => 3,
+                ProgramState::Idle => 4,
+                ProgramState::Clear => 5,
+            }
+        }
+        let (id, (record, _)) = self
+            .program_status
+            .iter()
+            .min_by_key(|(id, (r, seqno))| (rank(r.state), id.len(), std::cmp::Reverse(*seqno)))?;
+        let mut summary = record.clone();
+        if summary.app.is_none() {
+            summary.app = (0..id.len())
+                .rev()
+                .find_map(|n| self.program_status.get(&id[..n])?.0.app.clone());
+        }
+        Some(summary)
+    }
+
+    /// Apply one OSC 7501 report: replace (or clear) its record, then alert
+    /// if the summary moved.
+    fn apply_program_status(&mut self, report: ProgramStatus) {
+        const MAX_RECORDS: usize = 256;
+        if report.state == ProgramState::Clear {
+            let id = report.id;
+            self.program_status
+                .retain(|key, _| !(key.len() >= id.len() && key[..id.len()] == id[..]));
+        } else {
+            if self.program_status.len() >= MAX_RECORDS
+                && !self.program_status.contains_key(&report.id)
+            {
+                if let Some(oldest) = self
+                    .program_status
+                    .iter()
+                    .min_by_key(|(_, (_, seqno))| *seqno)
+                    .map(|(id, _)| id.clone())
+                {
+                    self.program_status.remove(&oldest);
+                }
+            }
+            let id = report.id.clone();
+            self.program_status.insert(id, (report, self.seqno));
+        }
+        self.alert_program_status_if_changed();
+    }
+
+    /// `working`, `blocked` and `idle` describe the command that is running;
+    /// a new prompt (OSC 133 A) means it is gone. `done`/`error` outlive it.
+    fn drop_command_scoped_program_status(&mut self) {
+        self.program_status
+            .retain(|_, (r, _)| matches!(r.state, ProgramState::Done | ProgramState::Error));
+        self.alert_program_status_if_changed();
+    }
+
+    fn clear_program_status(&mut self) {
+        self.program_status.clear();
+        self.alert_program_status_if_changed();
+    }
+
+    fn alert_program_status_if_changed(&mut self) {
+        let summary = self.program_status();
+        if summary == self.program_status_alerted {
+            return;
+        }
+        self.program_status_alerted = summary.clone();
+        if let Some(handler) = self.alert_handler.as_mut() {
+            handler.alert(Alert::ProgramStatus(summary));
+        }
+    }
+
+    /// True when a command finished (OSC 133 D) after focus was lost. The
+    /// unread signal for plain shells: prompt redraws and spinners bump the
+    /// seqno but not this.
+    pub fn has_unseen_command_result(&self) -> bool {
+        !self.focused && self.command_finished_seqno > self.lost_focus_seqno
+    }
+
+    fn mark_command_finished(&mut self) {
+        self.command_finished_seqno = self.seqno;
+        if self.has_unseen_command_result()
+            && self.lost_focus_seqno > self.command_finished_alerted_seqno
+        {
+            self.command_finished_alerted_seqno = self.seqno;
+            if let Some(handler) = self.alert_handler.as_mut() {
+                handler.alert(Alert::CommandFinishedSinceFocusLost);
+            }
+        }
+    }
+
     /// Returns the current working directory associated with the
     /// terminal session.  The working directory can be changed by
     /// the applicaiton using the OSC 7 escape sequence.
@@ -716,6 +828,14 @@ impl TerminalState {
     /// the alternate screen).
     pub fn screen_mut(&mut self) -> &mut Screen {
         &mut self.screen
+    }
+
+    /// Seed the primary screen's scrollback (session restore). Goes to the
+    /// primary screen even while the alternate screen is active.
+    pub fn prepend_scrollback(&mut self, lines: Vec<Line>) {
+        self.increment_seqno();
+        let seqno = self.seqno;
+        self.screen.screen.prepend_scrollback(lines, seqno);
     }
 
     fn set_clipboard_contents(

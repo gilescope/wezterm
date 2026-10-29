@@ -36,14 +36,15 @@ impl super::TermWindow {
 
     fn leave_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
-            UIItemType::TabBar(_) => {
-                self.update_title_post_status();
-            }
-            UIItemType::CloseTab(_)
+            // The tab bar rebuild for a hover change happens once, at the end
+            // of mouse_event_impl, when the ui item actually changed.
+            UIItemType::TabBar(_)
+            | UIItemType::CloseTab(_)
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
             | UIItemType::TabBarSeparator
+            | UIItemType::TabSearchRow(_)
             | UIItemType::Split(_) => {}
         }
     }
@@ -56,6 +57,7 @@ impl super::TermWindow {
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
             | UIItemType::TabBarSeparator
+            | UIItemType::TabSearchRow(_)
             | UIItemType::Split(_) => {}
         }
     }
@@ -70,19 +72,12 @@ impl super::TermWindow {
         self.current_mouse_event.replace(event.clone());
 
         let border = self.get_os_border();
-        let tab_pos = self.resolved_tab_bar_position();
 
-        let first_line_offset = if self.show_tab_bar && tab_pos == config::TabBarPosition::Top {
-            self.tab_bar_pixel_height().unwrap_or(0.) as isize
-        } else {
-            0
-        } + border.top.get() as isize;
-
-        let left_bar_offset = if self.show_tab_bar && tab_pos == config::TabBarPosition::Left {
-            self.tab_bar_pixel_width() as isize
-        } else {
-            0
-        };
+        // Both bars can be present at once (side bar + child row), so take
+        // the insets from the same helpers the renderer lays panes out with.
+        let (top_bar_height, _) = self.horizontal_bar_heights();
+        let first_line_offset = top_bar_height as isize + border.top.get() as isize;
+        let left_bar_offset = self.left_bar_width() as isize;
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -253,7 +248,17 @@ impl super::TermWindow {
             );
         }
 
-        if prior_ui_item != ui_item {
+        // The classic (non-fancy) bar highlights by mouse column, so it must
+        // rebuild on every move over a tab; the fancy bar only on a change.
+        let classic_hover = !self.config.use_fancy_tab_bar
+            && matches!(
+                &prior_ui_item,
+                Some(UIItem {
+                    item_type: UIItemType::TabBar(_),
+                    ..
+                })
+            );
+        if prior_ui_item != ui_item || classic_hover {
             self.update_title_post_status();
         }
     }
@@ -309,17 +314,7 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
-        let scroll_tab_pos = self.resolved_tab_bar_position();
-        let tab_bar_height = if self.show_tab_bar && !scroll_tab_pos.is_vertical() {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
-        };
-        let (top_bar_height, bottom_bar_height) = match scroll_tab_pos {
-            config::TabBarPosition::Bottom => (0.0, tab_bar_height),
-            config::TabBarPosition::Top => (tab_bar_height, 0.0),
-            _ => (0.0, 0.0),
-        };
+        let (top_bar_height, bottom_bar_height) = self.horizontal_bar_heights();
 
         let border = self.get_os_border();
         let y_offset = top_bar_height + border.top.get() as f32;
@@ -347,11 +342,26 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
-    fn find_tab_item_by_idx(&mut self, target_tab_idx: TabId) -> Option<&UIItem> {
+    /// A root tab appears in both the side bar and the child row, so the
+    /// lookup is restricted to the bar the drag started in.
+    fn find_tab_item_by_idx(&mut self, target_tab_idx: TabId, in_row: bool) -> Option<&UIItem> {
+        let row_bottom = self.row_bottom();
         self.ui_items.iter().find(|item| match item.item_type {
-            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => tab_idx == target_tab_idx,
+            UIItemType::TabBar(TabBarItem::Tab { tab_idx, .. }) => {
+                tab_idx == target_tab_idx && (item.y < row_bottom) == in_row
+            }
             _ => false,
         })
+    }
+
+    /// Pixel y below which a tab-bar ui item belongs to the child row.
+    fn row_bottom(&self) -> usize {
+        if self.is_tab_bar_vertical() && self.show_sub_tab_bar {
+            let (top, _) = self.horizontal_bar_heights();
+            (self.get_os_border().top.get() as f32 + top) as usize
+        } else {
+            0
+        }
     }
 
     fn drag_reorder_tab(
@@ -362,8 +372,9 @@ impl super::TermWindow {
         event: MouseEvent,
     ) {
         // Project the pointer onto the axis the tab bar runs along: x for a
-        // horizontal bar (Top/Bottom), y for a vertical bar (Left/Right).
-        let vertical = self.config.resolved_tab_bar_position().is_vertical();
+        // horizontal bar (Top/Bottom) or the child row, y for a vertical bar.
+        let in_row = item.y < self.row_bottom();
+        let vertical = self.config.resolved_tab_bar_position().is_vertical() && !in_row;
         let current = if vertical {
             event.coords.y
         } else {
@@ -378,8 +389,27 @@ impl super::TermWindow {
         let drag_forward = current.saturating_sub(start) > 0;
         let delta = if drag_forward { 1 } else { -1 };
 
-        let next_tab_idx = tab_idx.saturating_add_signed(delta);
-        if let Some(next_tab) = self.find_tab_item_by_idx(next_tab_idx) {
+        // The neighbour in the bar being dragged: the adjacent root for the
+        // side bar, the adjacent sibling for the row.
+        let next_tab_idx = {
+            let mux = Mux::get();
+            let Some(window) = mux.get_window(self.mux_window_id) else {
+                return;
+            };
+            if in_row || !self.is_tab_bar_vertical() {
+                tab_idx.saturating_add_signed(delta)
+            } else {
+                let roots = window.root_indices();
+                match roots.iter().position(|&i| i == tab_idx) {
+                    Some(r) => roots
+                        .get(r.saturating_add_signed(delta))
+                        .copied()
+                        .unwrap_or(tab_idx),
+                    None => tab_idx,
+                }
+            }
+        };
+        if let Some(next_tab) = self.find_tab_item_by_idx(next_tab_idx, in_row) {
             let (origin, size) = if vertical {
                 (next_tab.y, next_tab.height)
             } else {
@@ -389,7 +419,7 @@ impl super::TermWindow {
             let over_threshold = (drag_forward && current > next_tab_midpoint)
                 || (!drag_forward && current < next_tab_midpoint);
             if over_threshold && self.move_tab_relative(delta).is_ok() {
-                if let Some(tab) = self.find_tab_item_by_idx(next_tab_idx) {
+                if let Some(tab) = self.find_tab_item_by_idx(next_tab_idx, in_row) {
                     // Ensure we have updated tab index
                     item = tab.clone();
                 }
@@ -460,6 +490,28 @@ impl super::TermWindow {
             }
             UIItemType::TabBarSeparator => {
                 self.mouse_event_tab_bar_separator(item, event, context);
+            }
+            UIItemType::TabSearchRow(display_idx) => {
+                self.mouse_event_tab_search_row(display_idx, event, context);
+            }
+        }
+    }
+
+    fn mouse_event_tab_search_row(
+        &mut self,
+        display_idx: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let click = match event.kind {
+            WMEK::Press(MousePress::Left) => true,
+            WMEK::Move => false,
+            _ => return,
+        };
+        context.set_cursor(Some(CursorIcon::Default));
+        if let Some(modal) = self.get_modal() {
+            if let Some(search) = modal.downcast_ref::<crate::termwindow::tabsearch::TabSearch>() {
+                search.mouse_row(display_idx, click, self);
             }
         }
     }
@@ -592,8 +644,15 @@ impl super::TermWindow {
                     // For reordering tabs
                     self.dragging = Some((item, event));
                 }
+                TabBarItem::TabSearch => self.show_tab_search(),
                 TabBarItem::NewTabButton { .. } => {
-                    self.do_new_tab_button_click(MousePress::Left);
+                    // The `+` in the child row makes a child of the active
+                    // root; the side bar's `+` makes a new root tab.
+                    if item.y < self.row_bottom() {
+                        self.spawn_child_tab(&SpawnTabDomain::CurrentPaneDomain);
+                    } else {
+                        self.do_new_tab_button_click(MousePress::Left);
+                    }
                 }
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
                     let maximized = self
@@ -648,6 +707,7 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
+                | TabBarItem::TabSearch
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Press(MousePress::Right) => match tab_bar_item {
@@ -660,7 +720,10 @@ impl super::TermWindow {
                 TabBarItem::None => {
                     self.show_tab_bar_position_picker();
                 }
-                TabBarItem::LeftStatus | TabBarItem::RightStatus | TabBarItem::WindowButton(_) => {}
+                TabBarItem::LeftStatus
+                | TabBarItem::RightStatus
+                | TabBarItem::TabSearch
+                | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Move => match tab_bar_item {
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
@@ -678,11 +741,14 @@ impl super::TermWindow {
                 }
                 TabBarItem::WindowButton(_)
                 | TabBarItem::Tab { .. }
+                | TabBarItem::TabSearch
                 | TabBarItem::NewTabButton { .. } => {}
             },
             WMEK::VertWheel(n) => {
                 if self.config.mouse_wheel_scrolls_tabs {
-                    self.activate_tab_relative(if n < 1 { 1 } else { -1 }, true)
+                    // Stop at either end rather than wrapping: with a long
+                    // side bar, wrapping past the last tab is a surprise.
+                    self.activate_tab_relative(if n < 1 { 1 } else { -1 }, false)
                         .ok();
                 }
             }

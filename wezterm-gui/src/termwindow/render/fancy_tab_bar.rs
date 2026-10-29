@@ -54,6 +54,7 @@ const PLUS_BUTTON: &[Poly] = &[
 impl crate::TermWindow {
     pub fn invalidate_fancy_tab_bar(&mut self) {
         self.fancy_tab_bar.take();
+        self.fancy_sub_tab_bar.take();
     }
 
     pub fn build_fancy_tab_bar(&self, palette: &ColorPalette) -> anyhow::Result<ComputedElement> {
@@ -61,8 +62,16 @@ impl crate::TermWindow {
         if pos.is_vertical() {
             self.build_vertical_fancy_tab_bar(palette, pos)
         } else {
-            self.build_horizontal_fancy_tab_bar(palette, pos)
+            self.build_horizontal_fancy_tab_bar(palette, pos, BarRow::Main)
         }
+    }
+
+    /// The child-tab row shown above the panes next to a vertical bar.
+    pub fn build_fancy_sub_tab_bar(
+        &self,
+        palette: &ColorPalette,
+    ) -> anyhow::Result<ComputedElement> {
+        self.build_horizontal_fancy_tab_bar(palette, TabBarPosition::Top, BarRow::Sub)
     }
 
     /// Build the horizontal fancy tab bar (Top/Bottom positions).
@@ -71,11 +80,36 @@ impl crate::TermWindow {
         &self,
         palette: &ColorPalette,
         pos: TabBarPosition,
+        row: BarRow,
     ) -> anyhow::Result<ComputedElement> {
         let tab_bar_height = self.tab_bar_pixel_height()?;
         let font = self.fonts.title_font()?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
-        let items = self.tab_bar.items();
+        let border = self.get_os_border();
+        // The sub row is squeezed between the side bar and the window edge
+        // and never carries window buttons or status text.
+        let (bar, x0, bar_width, with_window_buttons) = match row {
+            BarRow::Main => (&self.tab_bar, 0., self.dimensions.pixel_width as f32, true),
+            BarRow::Sub => {
+                let left = self.left_bar_width();
+                let right = if self.resolved_tab_bar_position() == TabBarPosition::Right {
+                    self.tab_bar_pixel_width()
+                } else {
+                    0.
+                };
+                (
+                    &self.sub_tab_bar,
+                    left,
+                    (self.dimensions.pixel_width as f32 - left - right).max(0.),
+                    false,
+                )
+            }
+        };
+        let items: Vec<&TabEntry> = bar
+            .items()
+            .iter()
+            .filter(|item| with_window_buttons || !matches!(item.item, TabBarItem::WindowButton(_)))
+            .collect();
         let colors = self
             .config
             .colors
@@ -105,15 +139,15 @@ impl crate::TermWindow {
                 _ => 0.,
             })
             .sum();
-        let max_tab_width = ((self.dimensions.pixel_width as f32 / num_tabs)
-            - (1.5 * metrics.cell_size.width as f32))
-            .max(0.);
+        let max_tab_width =
+            ((bar_width / num_tabs) - (1.5 * metrics.cell_size.width as f32)).max(0.);
 
         // Reserve space for the native titlebar buttons
-        if self
-            .config
-            .window_decorations
-            .contains(::window::WindowDecorations::INTEGRATED_BUTTONS)
+        if with_window_buttons
+            && self
+                .config
+                .window_decorations
+                .contains(::window::WindowDecorations::INTEGRATED_BUTTONS)
             && self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
             && !self.window_state.contains(window::WindowState::FULL_SCREEN)
         {
@@ -130,7 +164,9 @@ impl crate::TermWindow {
         for item in items {
             match item.item {
                 TabBarItem::LeftStatus => left_status.push(item_to_elem(item)),
-                TabBarItem::None | TabBarItem::RightStatus => right_eles.push(item_to_elem(item)),
+                TabBarItem::None | TabBarItem::RightStatus | TabBarItem::TabSearch => {
+                    right_eles.push(item_to_elem(item))
+                }
                 TabBarItem::WindowButton(_) => {
                     if self.config.integrated_title_button_alignment
                         == IntegratedTitleButtonAlignment::Left
@@ -168,10 +204,11 @@ impl crate::TermWindow {
             );
         }
 
-        let window_buttons_at_left = self
-            .config
-            .window_decorations
-            .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
+        let window_buttons_at_left = with_window_buttons
+            && self
+                .config
+                .window_decorations
+                .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
             && (self.config.integrated_title_button_alignment
                 == IntegratedTitleButtonAlignment::Left
                 || self.config.integrated_title_button_style
@@ -215,12 +252,10 @@ impl crate::TermWindow {
         let tabs = Element::new(&font, content)
             .display(DisplayType::Block)
             .item_type(UIItemType::TabBar(TabBarItem::None))
-            .min_width(Some(Dimension::Pixels(self.dimensions.pixel_width as f32)))
+            .min_width(Some(Dimension::Pixels(bar_width)))
             .min_height(Some(Dimension::Pixels(tab_bar_height)))
             .vertical_align(tab_vertical_alignment)
             .colors(bar_colors);
-
-        let border = self.get_os_border();
 
         let mut computed = self.compute_element(
             &LayoutContext {
@@ -235,9 +270,9 @@ impl crate::TermWindow {
                     pixel_cell: metrics.cell_size.width as f32,
                 },
                 bounds: euclid::rect(
-                    border.left.get() as f32,
+                    border.left.get() as f32 + x0,
                     0.,
-                    self.dimensions.pixel_width as f32 - (border.left + border.right).get() as f32,
+                    bar_width - (border.left + border.right).get() as f32,
                     tab_bar_height,
                 ),
                 metrics: &metrics,
@@ -306,8 +341,8 @@ impl crate::TermWindow {
                     elem.max_width = Some(Dimension::Pixels(tab_bar_width));
                     tab_eles.push(elem);
                 }
-                TabBarItem::WindowButton(_) => {
-                    // Skip window buttons in vertical mode
+                TabBarItem::WindowButton(_) | TabBarItem::TabSearch => {
+                    // Window buttons and the search box live on the horizontal bar.
                 }
                 TabBarItem::Tab { tab_idx, active } => {
                     let mut elem = self.tab_item_to_element(
@@ -423,6 +458,62 @@ impl crate::TermWindow {
         };
         computed.translate(euclid::vec2(translate_x, 0.));
 
+        // More tabs than fit: slide the column (not the bar background) so
+        // the active tab is in view. The offset persists between builds and
+        // moves only as far as needed, so selecting a tab that is already
+        // visible does not shift the list. Tabs pushed above the top just
+        // draw off-screen; the wheel and the keys walk through them.
+        let avail = self.dimensions.pixel_height as f32 - (border.top + border.bottom).get() as f32;
+        let ui_items = computed.ui_items();
+        let bottom_of = |item: &UIItem| (item.y + item.height) as f32;
+        let active = ui_items.iter().find(|item| {
+            matches!(
+                item.item_type,
+                UIItemType::TabBar(TabBarItem::Tab { active: true, .. })
+            )
+        });
+        let last_tab = ui_items
+            .iter()
+            .filter(|item| matches!(item.item_type, UIItemType::TabBar(TabBarItem::Tab { .. })))
+            .max_by_key(|item| item.y);
+        let new_tab = ui_items
+            .iter()
+            .find(|item| matches!(item.item_type, UIItemType::TabBar(TabBarItem::NewTabButton)));
+        // Keep the active tab in view; when it is the last one, keep the `+`
+        // below it in view too, so the end of the list always offers a new tab.
+        let margin = metrics.cell_size.height as f32 * 0.5;
+        let total = ui_items
+            .iter()
+            .filter(|item| matches!(item.item_type, UIItemType::TabBar(_)))
+            .map(|item| bottom_of(item))
+            .fold(0f32, f32::max)
+            + margin;
+        let max_offset = (total - avail).max(0.);
+        let mut offset = self.tab_bar_scroll_offset.get().clamp(0., max_offset);
+        if let Some(a) = active {
+            let top = a.y as f32 - margin;
+            let mut bottom = bottom_of(a);
+            if last_tab.is_some_and(|l| l.y == a.y) {
+                if let Some(plus) = new_tab {
+                    bottom = bottom.max(bottom_of(plus));
+                }
+            }
+            let bottom = bottom + margin;
+            if bottom - offset > avail {
+                offset = (bottom - avail).clamp(0., max_offset);
+            } else if top - offset < 0. {
+                offset = top.clamp(0., max_offset);
+            }
+        }
+        self.tab_bar_scroll_offset.set(offset);
+        if offset > 0. {
+            if let ComputedElementContent::Children(kids) = &mut computed.content {
+                for kid in kids {
+                    kid.translate(euclid::vec2(0., -offset));
+                }
+            }
+        }
+
         Ok(computed)
     }
 
@@ -519,6 +610,34 @@ impl crate::TermWindow {
                 })
                 .border(BoxDimension::new(Dimension::Pixels(0.)))
                 .colors(bar_colors.clone()),
+            TabBarItem::TabSearch => {
+                Element::new(font, ElementContent::Text("⌕ search".to_string()))
+                    .vertical_align(VerticalAlign::Middle)
+                    .item_type(UIItemType::TabBar(item.item.clone()))
+                    .margin(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.5),
+                        top: Dimension::Cells(0.2),
+                        bottom: Dimension::Cells(0.),
+                    })
+                    .padding(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.5),
+                        top: Dimension::Cells(0.),
+                        bottom: Dimension::Cells(0.),
+                    })
+                    .border(BoxDimension::new(Dimension::Pixels(1.)))
+                    .colors(ElementColors {
+                        border: BorderColor::new(new_tab.fg_color.to_linear().mul_alpha(0.5)),
+                        bg: new_tab.bg_color.to_linear().into(),
+                        text: new_tab.fg_color.to_linear().mul_alpha(0.7).into(),
+                    })
+                    .hover_colors(Some(ElementColors {
+                        border: BorderColor::new(new_tab_hover.fg_color.to_linear()),
+                        bg: new_tab_hover.bg_color.to_linear().into(),
+                        text: new_tab_hover.fg_color.to_linear().into(),
+                    }))
+            }
             TabBarItem::NewTabButton => Element::new(
                 font,
                 ElementContent::Poly {
@@ -746,13 +865,31 @@ impl crate::TermWindow {
         let computed = self.fancy_tab_bar.as_ref().ok_or_else(|| {
             anyhow::anyhow!("paint_fancy_tab_bar called but fancy_tab_bar is None")
         })?;
+        self.paint_fancy_bar(computed)
+    }
+
+    pub fn paint_fancy_sub_tab_bar(&self) -> anyhow::Result<Vec<UIItem>> {
+        let computed = self.fancy_sub_tab_bar.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("paint_fancy_sub_tab_bar called but fancy_sub_tab_bar is None")
+        })?;
+        self.paint_fancy_bar(computed)
+    }
+
+    fn paint_fancy_bar(&self, computed: &ComputedElement) -> anyhow::Result<Vec<UIItem>> {
         let ui_items = computed.ui_items();
-
         let gl_state = self.render_state.as_ref().unwrap();
-        self.render_element(&computed, gl_state, None)?;
-
+        self.render_element(computed, gl_state, None)?;
         Ok(ui_items)
     }
+}
+
+/// Which horizontal bar `build_horizontal_fancy_tab_bar` lays out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BarRow {
+    /// The tab bar itself, at the Top or Bottom.
+    Main,
+    /// The child-tab row beside a vertical bar.
+    Sub,
 }
 
 fn make_x_button(

@@ -11,7 +11,7 @@ use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
-use crate::termwindow::{DimensionContext, TermWindow};
+use crate::termwindow::{DimensionContext, TermWindow, UIItemType};
 use crate::utilsprites::RenderMetrics;
 use config::keyassignment::KeyAssignment;
 use config::Dimension;
@@ -238,7 +238,8 @@ impl TabSearch {
                         bottom: Dimension::Cells(0.),
                     })
                     .min_width(Some(Dimension::Percent(1.)))
-                    .display(DisplayType::Block),
+                    .display(DisplayType::Block)
+                    .item_type(UIItemType::TabSearchRow(display_idx)),
             );
         }
 
@@ -361,6 +362,28 @@ impl TabSearch {
         let idx = *matches.as_ref()?.matches.get(selected)?;
         Some(self.choices[idx].tab_idx)
     }
+
+    /// Close the dropdown and switch to the highlighted tab.
+    fn activate_selected(&self, term_window: &mut TermWindow) {
+        let target = self.selected_tab_idx();
+        term_window.cancel_modal();
+        if let Some(tab_idx) = target {
+            if let Err(err) = term_window.activate_tab(tab_idx as isize) {
+                log::error!("tab search: activate tab {tab_idx}: {err:#}");
+            }
+        }
+    }
+
+    /// Mouse over a row highlights it; a click takes it.
+    pub fn mouse_row(&self, display_idx: usize, click: bool, term_window: &mut TermWindow) {
+        if *self.selected_row.borrow() != display_idx {
+            *self.selected_row.borrow_mut() = display_idx;
+            term_window.invalidate_modal();
+        }
+        if click {
+            self.activate_selected(term_window);
+        }
+    }
 }
 
 impl Modal for TabSearch {
@@ -405,13 +428,7 @@ impl Modal for TabSearch {
                 self.updated_input();
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                let target = self.selected_tab_idx();
-                term_window.cancel_modal();
-                if let Some(tab_idx) = target {
-                    if let Err(err) = term_window.activate_tab(tab_idx as isize) {
-                        log::error!("tab search: activate tab {tab_idx}: {err:#}");
-                    }
-                }
+                self.activate_selected(term_window);
                 return Ok(true);
             }
             _ => return Ok(false),

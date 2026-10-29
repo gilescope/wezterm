@@ -166,6 +166,8 @@ pub enum UIItemType {
     /// Draggable handle on the inner edge of a vertical (Left/Right) tab bar,
     /// used to resize the tab bar width.
     TabBarSeparator,
+    /// A row of the tab search dropdown, by display position.
+    TabSearchRow(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

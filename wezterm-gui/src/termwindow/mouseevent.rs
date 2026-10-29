@@ -44,6 +44,7 @@ impl super::TermWindow {
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
             | UIItemType::TabBarSeparator
+            | UIItemType::TabSearchRow(_)
             | UIItemType::Split(_) => {}
         }
     }
@@ -56,6 +57,7 @@ impl super::TermWindow {
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
             | UIItemType::TabBarSeparator
+            | UIItemType::TabSearchRow(_)
             | UIItemType::Split(_) => {}
         }
     }
@@ -488,6 +490,28 @@ impl super::TermWindow {
             }
             UIItemType::TabBarSeparator => {
                 self.mouse_event_tab_bar_separator(item, event, context);
+            }
+            UIItemType::TabSearchRow(display_idx) => {
+                self.mouse_event_tab_search_row(display_idx, event, context);
+            }
+        }
+    }
+
+    fn mouse_event_tab_search_row(
+        &mut self,
+        display_idx: usize,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let click = match event.kind {
+            WMEK::Press(MousePress::Left) => true,
+            WMEK::Move => false,
+            _ => return,
+        };
+        context.set_cursor(Some(CursorIcon::Default));
+        if let Some(modal) = self.get_modal() {
+            if let Some(search) = modal.downcast_ref::<crate::termwindow::tabsearch::TabSearch>() {
+                search.mouse_row(display_idx, click, self);
             }
         }
     }

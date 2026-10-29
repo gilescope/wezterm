@@ -32,8 +32,13 @@ pub enum TabBarItem {
     None,
     LeftStatus,
     RightStatus,
-    Tab { tab_idx: usize, active: bool },
+    Tab {
+        tab_idx: usize,
+        active: bool,
+    },
     NewTabButton,
+    /// Opens the tab search dropdown; drawn at the right of a horizontal bar.
+    TabSearch,
     WindowButton(IntegratedTitleButton),
 }
 
@@ -796,6 +801,21 @@ impl TabBarState {
                 width,
             });
 
+            x += width;
+        }
+
+        // Search box: the fancy bar floats it right; the retro bar has no
+        // float, so it sits after the `+` there.
+        if config.show_tab_search_in_tab_bar {
+            let search = parse_status_text(" ⌕ ", black_cell.attrs().clone());
+            let width = search.len();
+            line.append_line(search.clone(), SEQ_ZERO);
+            items.push(TabEntry {
+                item: TabBarItem::TabSearch,
+                title: search,
+                x,
+                width,
+            });
             x += width;
         }
 

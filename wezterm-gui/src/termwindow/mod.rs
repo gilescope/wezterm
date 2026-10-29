@@ -85,6 +85,7 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+pub mod tabsearch;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
@@ -2638,6 +2639,12 @@ impl TermWindow {
         promise::spawn::spawn(future).detach();
     }
 
+    /// Dropdown under the bar's search box: type to fuzzy-match a tab.
+    pub fn show_tab_search(&mut self) {
+        let modal = tabsearch::TabSearch::new(self);
+        self.set_modal(Rc::new(modal));
+    }
+
     fn show_tab_navigator(&mut self) {
         let mux = Mux::get();
         let active_tab_idx = match mux.get_window(self.mux_window_id) {
@@ -3114,6 +3121,7 @@ impl TermWindow {
             ScrollToTop => self.scroll_to_top(pane),
             ScrollToBottom => self.scroll_to_bottom(pane),
             ShowTabNavigator => self.show_tab_navigator(),
+            ShowTabSearch => self.show_tab_search(),
             ShowDebugOverlay => self.show_debug_overlay(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {

@@ -30,6 +30,9 @@ As features stabilize some brief notes about them will accumulate here.
 * Scrollback can survive a restart: [pane:save_scrollback()](config/lua/pane/save_scrollback.md)
   and [pane:load_scrollback()](config/lua/pane/load_scrollback.md) write and
   reseed a pane's history, for use from `update-status` and `gui-startup`.
+* Tab search: [ShowTabSearch](config/lua/keyassignment/ShowTabSearch.md)
+  (`SUPER+SHIFT+f`, or the `⌕ search` box at the right of the tab bar) drops
+  down a fuzzy-matched list of the window's tabs to switch to.
 * Nested tabs: [SpawnChildTab](config/lua/keyassignment/SpawnChildTab.md)
   opens a tab under the current tab's root. With a Left/Right tab bar the
   side bar lists roots and the active root's children appear in a row across

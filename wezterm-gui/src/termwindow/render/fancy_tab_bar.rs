@@ -164,7 +164,9 @@ impl crate::TermWindow {
         for item in items {
             match item.item {
                 TabBarItem::LeftStatus => left_status.push(item_to_elem(item)),
-                TabBarItem::None | TabBarItem::RightStatus => right_eles.push(item_to_elem(item)),
+                TabBarItem::None | TabBarItem::RightStatus | TabBarItem::TabSearch => {
+                    right_eles.push(item_to_elem(item))
+                }
                 TabBarItem::WindowButton(_) => {
                     if self.config.integrated_title_button_alignment
                         == IntegratedTitleButtonAlignment::Left
@@ -339,8 +341,8 @@ impl crate::TermWindow {
                     elem.max_width = Some(Dimension::Pixels(tab_bar_width));
                     tab_eles.push(elem);
                 }
-                TabBarItem::WindowButton(_) => {
-                    // Skip window buttons in vertical mode
+                TabBarItem::WindowButton(_) | TabBarItem::TabSearch => {
+                    // Window buttons and the search box live on the horizontal bar.
                 }
                 TabBarItem::Tab { tab_idx, active } => {
                     let mut elem = self.tab_item_to_element(
@@ -608,6 +610,34 @@ impl crate::TermWindow {
                 })
                 .border(BoxDimension::new(Dimension::Pixels(0.)))
                 .colors(bar_colors.clone()),
+            TabBarItem::TabSearch => {
+                Element::new(font, ElementContent::Text("⌕ search".to_string()))
+                    .vertical_align(VerticalAlign::Middle)
+                    .item_type(UIItemType::TabBar(item.item.clone()))
+                    .margin(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.5),
+                        top: Dimension::Cells(0.2),
+                        bottom: Dimension::Cells(0.),
+                    })
+                    .padding(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.5),
+                        top: Dimension::Cells(0.),
+                        bottom: Dimension::Cells(0.),
+                    })
+                    .border(BoxDimension::new(Dimension::Pixels(1.)))
+                    .colors(ElementColors {
+                        border: BorderColor::new(new_tab.fg_color.to_linear().mul_alpha(0.5)),
+                        bg: new_tab.bg_color.to_linear().into(),
+                        text: new_tab.fg_color.to_linear().mul_alpha(0.7).into(),
+                    })
+                    .hover_colors(Some(ElementColors {
+                        border: BorderColor::new(new_tab_hover.fg_color.to_linear()),
+                        bg: new_tab_hover.bg_color.to_linear().into(),
+                        text: new_tab_hover.fg_color.to_linear().into(),
+                    }))
+            }
             TabBarItem::NewTabButton => Element::new(
                 font,
                 ElementContent::Poly {

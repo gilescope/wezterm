@@ -517,6 +517,9 @@ pub struct Config {
     pub show_new_tab_button_in_tab_bar: bool,
 
     #[dynamic(default = "default_true")]
+    pub show_tab_search_in_tab_bar: bool,
+
+    #[dynamic(default = "default_true")]
     pub show_close_tab_button_in_tabs: bool,
 
     /// If true, show_tab_index_in_tab_bar uses a zero-based index.

@@ -1681,6 +1681,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window", "Select Tab"],
             icon: Some("cod_list_flat"),
         },
+        ShowTabSearch => CommandDef {
+            brief: "Search tabs".into(),
+            doc: "Type to fuzzy-match a tab by title, directory or program and switch to it".into(),
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "f".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window", "Select Tab"],
+            icon: Some("cod_search"),
+        },
         DetachDomain(SpawnTabDomain::CurrentPaneDomain) => CommandDef {
             brief: "Detach the domain of the active pane".into(),
             doc: "Detaches (disconnects from) the domain of the active pane".into(),
@@ -2196,6 +2204,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateLastTab,
         ShowLauncher,
         ShowTabNavigator,
+        ShowTabSearch,
         // ----------------- Help
         OpenUri("https://wezterm.org/".to_string()),
         OpenUri("https://github.com/wezterm/wezterm/discussions/".to_string()),

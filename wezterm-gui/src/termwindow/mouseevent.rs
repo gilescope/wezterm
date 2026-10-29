@@ -620,6 +620,7 @@ impl super::TermWindow {
                     // For reordering tabs
                     self.dragging = Some((item, event));
                 }
+                TabBarItem::TabSearch => self.show_tab_search(),
                 TabBarItem::NewTabButton { .. } => {
                     // The `+` in the child row makes a child of the active
                     // root; the side bar's `+` makes a new root tab.
@@ -682,6 +683,7 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
+                | TabBarItem::TabSearch
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Press(MousePress::Right) => match tab_bar_item {
@@ -694,7 +696,10 @@ impl super::TermWindow {
                 TabBarItem::None => {
                     self.show_tab_bar_position_picker();
                 }
-                TabBarItem::LeftStatus | TabBarItem::RightStatus | TabBarItem::WindowButton(_) => {}
+                TabBarItem::LeftStatus
+                | TabBarItem::RightStatus
+                | TabBarItem::TabSearch
+                | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Move => match tab_bar_item {
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
@@ -712,6 +717,7 @@ impl super::TermWindow {
                 }
                 TabBarItem::WindowButton(_)
                 | TabBarItem::Tab { .. }
+                | TabBarItem::TabSearch
                 | TabBarItem::NewTabButton { .. } => {}
             },
             WMEK::VertWheel(n) => {

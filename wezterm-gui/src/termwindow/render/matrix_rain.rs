@@ -22,7 +22,7 @@ use wezterm_font::GlyphInfo;
 use window::WindowOps;
 
 /// Total length of the transition.
-const DURATION_MS: f32 = 4200.0;
+const DURATION_MS: f32 = 2100.0;
 /// Per-column matrix-glyph run length (the stream that leads each real char),
 /// in cells. Each column picks a value in this inclusive range.
 const MATRIX_MIN: i32 = 3;
@@ -47,6 +47,95 @@ const ZOOM_SETTLE: f32 = 0.35;
 /// back to the user's font if it isn't installed.
 const MATRIX_FONT_FAMILY: &str = "Matrix Code NFI";
 
+/// Chance that a tab switch decodes an easter-egg figure into the rain.
+const EGG_PROBABILITY: f32 = 0.5;
+/// Centre of the egg within the transition. The rain NEVER pauses — the figure
+/// matrixes in and out *within* the still-streaming code.
+const EGG_MIDPOINT: f32 = 0.5;
+/// Egg phase durations as fractions of the (now 2.1s) transition: matrix the
+/// figure in, linger at full, then matrix it out. The hold is ~0.40 × 2100 ≈
+/// 840 ms — kept the same readable linger even though the rain is 2× faster.
+const EGG_RISE: f32 = 0.22;
+const EGG_HOLD: f32 = 0.40;
+const EGG_FALL: f32 = 0.22;
+
+/// Iconic film lines, hidden in plain sight in the rain.
+const QUOTES: &[&str] = &[
+    "Wake up, Neo...",
+    "Follow the white rabbit.",
+    "There is no spoon.",
+    "Knock, knock, Neo.",
+    "The Matrix has you...",
+    "Free your mind.",
+    "I know kung fu.",
+    "Welcome to the real world.",
+    "Dodge this.",
+    "Mr. Anderson...",
+    "Know thyself.",
+    "Guns. Lots of guns.",
+    "What is real?",
+    "He is the One.",
+    "Deja vu.",
+    "Welcome to the desert of the real.",
+    "I'm trying to free your mind, Neo.\nBut I can only show you the door.",
+    "Never send a human\nto do a machine's job.",
+    "Fate, it seems, is not\nwithout a sense of irony.",
+    "The Matrix is everywhere.",
+    "Choice is an illusion created\nbetween those with power\nand those without.",
+    "There is a difference between\nknowing the path\nand walking the path.",
+    "Do you think that's air\nyou're breathing now?",
+    "What you know\nyou can't explain,\nbut you feel it.",
+    "Don't think you are.\nKnow you are.",
+    "Don't worry about the vase.",
+    "Everything that has a\nbeginning has an end.",
+    "The body cannot live\nwithout the mind.",
+    "You have to let it all go, Neo.",
+    "He's beginning to believe.",
+    "What good is a phone call\nif you're unable to speak?",
+];
+
+/// A decoded easter egg: a centred grid of a film quote's characters. The live
+/// rain decodes it in, holds, then dissolves it back into the stream.
+struct Egg {
+    x0: i32,
+    y0: i32,
+    fw: usize,
+    fh: usize,
+    /// Per-cell glyph codepoint (0 = empty).
+    glyphs: Vec<u32>,
+}
+
+impl Egg {
+    /// Lay a (possibly multi-line) quote out centred in the pane grid.
+    fn from_quote(text: &str, cols: usize, rows: usize) -> Egg {
+        let lines: Vec<&str> = text.split('\n').collect();
+        let fw = lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let fh = lines.len().max(1);
+        let mut glyphs = vec![0u32; fw * fh];
+        for (r, line) in lines.iter().enumerate() {
+            // Centre each line within the block so multi-line quotes look tidy.
+            let off = (fw - line.chars().count()) / 2;
+            for (c, ch) in line.chars().enumerate() {
+                if ch != ' ' {
+                    glyphs[r * fw + off + c] = ch as u32;
+                }
+            }
+        }
+        Egg {
+            x0: (cols as i32 - fw as i32) / 2,
+            y0: (rows as i32 - fh as i32) / 2,
+            fw,
+            fh,
+            glyphs,
+        }
+    }
+}
+
 /// Captured state for one tab-switch transition.
 pub struct TabSwitchAnim {
     start: Instant,
@@ -64,6 +153,9 @@ pub struct TabSwitchAnim {
     /// Memoised shaping of each real grapheme, filled lazily as cells resolve.
     /// `None` records a grapheme that has no drawable glyph (blank/unshaped).
     glyphs: RefCell<HashMap<String, Option<GlyphInfo>>>,
+    /// Easter-egg film quote to decode mid-transition, if this switch rolled
+    /// one. It plays within the normal duration; the rain never pauses.
+    egg: Option<Egg>,
 }
 
 /// Cheap deterministic 3-input hash (FNV-1a flavoured). Used to give each
@@ -147,6 +239,14 @@ impl crate::TermWindow {
             return;
         }
 
+        // Roll for an easter-egg film quote, decoded into the rain.
+        let egg = if fastrand::f32() < EGG_PROBABILITY {
+            let quote = QUOTES[fastrand::usize(0..QUOTES.len())];
+            Some(Egg::from_quote(quote, cols, rows))
+        } else {
+            None
+        };
+
         self.tab_switch_anim = Some(TabSwitchAnim {
             start: Instant::now(),
             pane_id: new_pane.pane_id(),
@@ -158,6 +258,7 @@ impl crate::TermWindow {
             // Real glyphs are shaped lazily, on demand, as cells resolve — so
             // we never pay for the whole screen up front (which could stall).
             glyphs: RefCell::new(HashMap::new()),
+            egg,
         });
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -248,27 +349,8 @@ impl crate::TermWindow {
     /// in `paint_pane` so the rain lines up with the real cells.
     fn matrix_pane_origin(&self, pane_left: usize, pane_top: usize) -> (f32, f32) {
         let (padding_left, padding_top) = self.padding_left_top();
-        let tab_pos = self.resolved_tab_bar_position();
-        let tab_bar_height = if self.show_tab_bar && !tab_pos.is_vertical() {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
-        };
-        let tab_bar_width = if self.show_tab_bar {
-            self.tab_bar_pixel_width()
-        } else {
-            0.
-        };
-        let top_bar_height = if tab_pos == config::TabBarPosition::Top {
-            tab_bar_height
-        } else {
-            0.
-        };
-        let left_bar_width = if tab_pos == config::TabBarPosition::Left {
-            tab_bar_width
-        } else {
-            0.
-        };
+        let (top_bar_height, _) = self.horizontal_bar_heights();
+        let left_bar_width = self.left_bar_width();
         let border = self.get_os_border();
         let cell_w = self.render_metrics.cell_size.width as f32;
         let cell_h = self.render_metrics.cell_size.height as f32;
@@ -582,6 +664,181 @@ impl crate::TermWindow {
             }
         }
 
+        // Easter egg: the quote matrixes ON (rain glyphs sweep down and settle
+        // into the text) then OFF, within the live rain, which never pauses.
+        let egg_total = EGG_RISE + EGG_HOLD + EGG_FALL;
+        let egg_t0 = EGG_MIDPOINT - egg_total / 2.0;
+        if let Some(egg) = anim.egg.as_ref() {
+            if p >= egg_t0 && p <= egg_t0 + egg_total {
+                self.paint_egg(
+                    layers,
+                    &mut glyph_cache,
+                    anim,
+                    &mut shape_budget,
+                    egg,
+                    p,
+                    palette,
+                    quantum,
+                    &style,
+                    &font,
+                    &matrix_style,
+                    &matrix_font,
+                    ox,
+                    oy,
+                    cols,
+                    rows,
+                    cell_w,
+                    cell_h,
+                    left_off,
+                    top_off,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Draw one frame of the egg figure *within* the live, streaming rain. The
+    /// figure matrixes ON then OFF: a front sweeps top→bottom; ahead of it the
+    /// figure cells flicker as green matrix glyphs, behind it they settle into
+    /// the white-green text. Past the peak, a second front dissolves it
+    /// the same way. The rain underneath never pauses.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_egg(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        glyph_cache: &mut crate::glyphcache::GlyphCache,
+        anim: &TabSwitchAnim,
+        shape_budget: &mut i32,
+        egg: &Egg,
+        p: f32,
+        palette: &[GlyphInfo],
+        quantum: u32,
+        style: &config::TextStyle,
+        font: &std::rc::Rc<wezterm_font::LoadedFont>,
+        matrix_style: &config::TextStyle,
+        matrix_font: &std::rc::Rc<wezterm_font::LoadedFont>,
+        ox: f32,
+        oy: f32,
+        cols: usize,
+        rows: usize,
+        cell_w: f32,
+        cell_h: f32,
+        left_off: f32,
+        top_off: f32,
+    ) -> anyhow::Result<()> {
+        // Length (in figure rows) of the flickering decode band at each front.
+        const LEAD: f32 = 5.0;
+        let span = egg.fh as f32 + LEAD;
+        // Local time within the egg: rise (matrix in), hold (linger), fall (out).
+        let t0 = EGG_MIDPOINT - (EGG_RISE + EGG_HOLD + EGG_FALL) / 2.0;
+        let local = p - t0;
+        let (building, front) = if local < EGG_RISE {
+            (true, (local / EGG_RISE).clamp(0.0, 1.0) * span)
+        } else if local < EGG_RISE + EGG_HOLD {
+            (true, span) // hold: fully settled
+        } else {
+            (
+                false,
+                ((local - EGG_RISE - EGG_HOLD) / EGG_FALL).clamp(0.0, 1.0) * span,
+            )
+        };
+
+        for fr in 0..egg.fh {
+            let frf = fr as f32;
+            // Per-row state relative to the sweeping front.
+            // building: settled below front-LEAD, flickering in the band, unseen above front.
+            // dissolving: gone below front-LEAD, flickering in the band, settled above front.
+            enum Cell {
+                Settled,
+                Flicker,
+                Skip,
+            }
+            let state = if building {
+                if frf < front - LEAD {
+                    Cell::Settled
+                } else if frf <= front {
+                    Cell::Flicker
+                } else {
+                    Cell::Skip
+                }
+            } else if frf < front - LEAD {
+                Cell::Skip
+            } else if frf <= front {
+                Cell::Flicker
+            } else {
+                Cell::Settled
+            };
+            if matches!(state, Cell::Skip) {
+                continue;
+            }
+
+            for fc in 0..egg.fw {
+                let code = egg.glyphs[fr * egg.fw + fc];
+                if code == 0 {
+                    continue;
+                }
+                let cc = egg.x0 + fc as i32;
+                let rr = egg.y0 + fr as i32;
+                if cc < 0 || cc >= cols as i32 || rr < 0 || rr >= rows as i32 {
+                    continue;
+                }
+
+                match state {
+                    Cell::Settled => {
+                        // Settled quote character in bright white-green.
+                        let color = LinearRgba::with_components(0.85, 1.0, 0.88, 1.0);
+                        let glyph = char::from_u32(code).unwrap_or('\u{2588}');
+                        let mut buf = [0u8; 4];
+                        let g = glyph.encode_utf8(&mut buf);
+                        if let Some(info) = self.memo_glyph(anim, g, shape_budget) {
+                            self.emit_matrix_glyph(
+                                layers,
+                                glyph_cache,
+                                &info,
+                                style,
+                                font,
+                                &self.render_metrics,
+                                ox,
+                                oy,
+                                cell_w,
+                                cell_h,
+                                cc as usize,
+                                rr as f32,
+                                color,
+                                1.0,
+                                left_off,
+                                top_off,
+                            )?;
+                        }
+                    }
+                    Cell::Flicker if !palette.is_empty() => {
+                        // Green matrix glyph, flickering as the figure decodes.
+                        let idx = hash3(cc as u32, rr as u32, quantum) as usize % palette.len();
+                        let color = LinearRgba::with_components(0.2, 1.0, 0.3, 1.0);
+                        self.emit_matrix_glyph(
+                            layers,
+                            glyph_cache,
+                            &palette[idx],
+                            matrix_style,
+                            matrix_font,
+                            &self.render_metrics,
+                            ox,
+                            oy,
+                            cell_w,
+                            cell_h,
+                            cc as usize,
+                            rr as f32,
+                            color,
+                            1.0,
+                            left_off,
+                            top_off,
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+        }
         Ok(())
     }
 }

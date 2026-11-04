@@ -585,6 +585,7 @@ pub enum KeyAssignment {
     ScrollToBottom,
     ShowTabNavigator,
     ShowTabSearch,
+    ActivateTabHistory(isize),
     ShowDebugOverlay,
     HideApplication,
     QuitApplication,

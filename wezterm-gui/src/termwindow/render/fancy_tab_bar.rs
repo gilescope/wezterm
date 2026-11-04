@@ -341,8 +341,11 @@ impl crate::TermWindow {
                     elem.max_width = Some(Dimension::Pixels(tab_bar_width));
                     tab_eles.push(elem);
                 }
-                TabBarItem::WindowButton(_) | TabBarItem::TabSearch => {
-                    // Window buttons and the search box live on the horizontal bar.
+                TabBarItem::WindowButton(_)
+                | TabBarItem::TabSearch
+                | TabBarItem::History { .. } => {
+                    // Window buttons, the search box and the history
+                    // buttons live on the horizontal bar.
                 }
                 TabBarItem::Tab { tab_idx, active } => {
                     let mut elem = self.tab_item_to_element(
@@ -610,6 +613,37 @@ impl crate::TermWindow {
                 })
                 .border(BoxDimension::new(Dimension::Pixels(0.)))
                 .colors(bar_colors.clone()),
+            TabBarItem::History { back, enabled } => {
+                let text = if back { "←" } else { "→" };
+                // A dead end is drawn faint and does not light up on hover.
+                let alpha = if enabled { 0.7 } else { 0.25 };
+                Element::new(font, ElementContent::Text(text.to_string()))
+                    .vertical_align(VerticalAlign::Middle)
+                    .item_type(UIItemType::TabBar(item.item.clone()))
+                    .margin(BoxDimension {
+                        left: Dimension::Cells(if back { 0.5 } else { 0. }),
+                        right: Dimension::Cells(0.25),
+                        top: Dimension::Cells(0.2),
+                        bottom: Dimension::Cells(0.),
+                    })
+                    .padding(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.5),
+                        top: Dimension::Cells(0.),
+                        bottom: Dimension::Cells(0.),
+                    })
+                    .border(BoxDimension::new(Dimension::Pixels(1.)))
+                    .colors(ElementColors {
+                        border: BorderColor::new(new_tab.fg_color.to_linear().mul_alpha(alpha)),
+                        bg: new_tab.bg_color.to_linear().into(),
+                        text: new_tab.fg_color.to_linear().mul_alpha(alpha).into(),
+                    })
+                    .hover_colors(enabled.then(|| ElementColors {
+                        border: BorderColor::new(new_tab_hover.fg_color.to_linear()),
+                        bg: new_tab_hover.bg_color.to_linear().into(),
+                        text: new_tab_hover.fg_color.to_linear().into(),
+                    }))
+            }
             TabBarItem::TabSearch => {
                 Element::new(font, ElementContent::Text("⌕ search".to_string()))
                     .vertical_align(VerticalAlign::Middle)

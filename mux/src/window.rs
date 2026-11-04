@@ -12,6 +12,11 @@ pub struct Window {
     tabs: Vec<Arc<Tab>>,
     active_tab_idx: usize,
     last_active_tab_id: Option<TabId>,
+    /// Tabs the user switched to, oldest first, by id so a reorder or a
+    /// close cannot point it at the wrong tab. `history_pos` is the entry
+    /// we are at; later entries are what "forward" returns to.
+    tab_history: Vec<TabId>,
+    history_pos: usize,
     workspace: String,
     title: String,
     initial_position: Option<GuiPosition>,
@@ -25,6 +30,8 @@ impl Window {
             tabs: vec![],
             active_tab_idx: 0,
             last_active_tab_id: None,
+            tab_history: vec![],
+            history_pos: 0,
             title: String::new(),
             workspace: workspace.unwrap_or_else(|| Mux::get().active_workspace()),
             initial_position,
@@ -341,7 +348,90 @@ impl Window {
             return;
         }
         self.remember_current_as_last_active_tab();
+        self.record_history(idx);
         self.set_active_tab_idx_without_saving(idx);
+    }
+
+    /// Entries a walk keeps, oldest dropped first.
+    const HISTORY_CAP: usize = 100;
+
+    /// Note a user switch to `idx` in the browser-style history: the forward
+    /// entries are dropped, as a browser does when you navigate afresh.
+    fn record_history(&mut self, idx: usize) {
+        self.sync_history_to_active();
+        if let Some(tab) = self.tabs.get(idx) {
+            self.push_history(tab.tab_id());
+        }
+    }
+
+    /// The window can move on its own (the active tab closed), so the entry
+    /// at `history_pos` is not always where we are. Splice the active tab in
+    /// after it, keeping the forward entries, so a walk from here includes
+    /// the tab being left.
+    fn sync_history_to_active(&mut self) {
+        let Some(cur) = self.tabs.get(self.active_tab_idx).map(|t| t.tab_id()) else {
+            return;
+        };
+        if self.tab_history.get(self.history_pos) == Some(&cur) {
+            return;
+        }
+        if !self.tab_history.is_empty() {
+            self.history_pos += 1;
+        }
+        self.tab_history.insert(self.history_pos, cur);
+        if self.tab_history.len() > Self::HISTORY_CAP {
+            self.tab_history.remove(0);
+            self.history_pos -= 1;
+        }
+    }
+
+    fn push_history(&mut self, id: TabId) {
+        if !self.tab_history.is_empty() {
+            self.tab_history.truncate(self.history_pos + 1);
+        }
+        if self.tab_history.last() != Some(&id) {
+            self.tab_history.push(id);
+        }
+        if self.tab_history.len() > Self::HISTORY_CAP {
+            self.tab_history.remove(0);
+        }
+        self.history_pos = self.tab_history.len() - 1;
+    }
+
+    /// The history position `delta` steps away (negative = back) that names
+    /// a live tab other than the active one. Closed tabs stay in the list
+    /// and are stepped over, so no pruning is needed.
+    fn history_target(&self, delta: isize) -> Option<(usize, usize)> {
+        let step = delta.signum();
+        let mut pos = self.history_pos;
+        for _ in 0..delta.unsigned_abs() {
+            loop {
+                pos = pos.checked_add_signed(step)?;
+                let idx = self.get_tab_idx_for_id(*self.tab_history.get(pos)?);
+                match idx {
+                    Some(idx) if idx != self.active_tab_idx => break,
+                    _ => {}
+                }
+            }
+        }
+        let idx = self.get_tab_idx_for_id(self.tab_history[pos])?;
+        Some((pos, idx))
+    }
+
+    /// Whether a back (negative) or forward step has somewhere to go.
+    pub fn can_step_history(&self, delta: isize) -> bool {
+        self.history_target(delta).is_some()
+    }
+
+    /// Browser-style back/forward: activate the tab `delta` steps away in
+    /// the history without recording a new entry. Returns its index.
+    pub fn history_step(&mut self, delta: isize) -> Option<usize> {
+        self.sync_history_to_active();
+        let (pos, idx) = self.history_target(delta)?;
+        self.history_pos = pos;
+        self.remember_current_as_last_active_tab();
+        self.set_active_tab_idx_without_saving(idx);
+        Some(idx)
     }
 
     /// Make given index the active tab without remembering current tab as the "last active" tab.
@@ -541,7 +631,14 @@ mod test {
             w.attach_tab_to_parent(child.tab_id(), root.tab_id());
         }
         // Order: A a1 a2 B b1 C
-        let expect = [(0, 0..3), (0, 0..3), (0, 0..3), (3, 3..5), (3, 3..5), (5, 5..6)];
+        let expect = [
+            (0, 0..3),
+            (0, 0..3),
+            (0, 0..3),
+            (3, 3..5),
+            (3, 3..5),
+            (5, 5..6),
+        ];
         for (idx, (root, block)) in expect.iter().enumerate() {
             w.remember_and_set_active_tab_idx(idx);
             let (roots, row) = w.bar_layout();
@@ -550,5 +647,77 @@ mod test {
             assert_eq!(row, *block, "row block with tab {idx} active");
             assert!(row.contains(&idx), "row holds the active tab {idx}");
         }
+    }
+}
+
+#[cfg(test)]
+mod history_test {
+    use super::*;
+    use wezterm_term::TerminalSize;
+
+    fn window_with(n: usize) -> Window {
+        let mut w = Window::new(Some("test".into()), None);
+        for _ in 0..n {
+            w.push_tab(&Arc::new(Tab::new(&TerminalSize::default())));
+        }
+        w
+    }
+
+    /// Back walks to earlier tabs, forward returns, and a fresh activation
+    /// drops the forward entries, as a browser's history does.
+    #[test]
+    fn history_steps_back_and_forward_like_a_browser() {
+        let mut w = window_with(4);
+        assert!(!w.can_step_history(-1));
+        w.remember_and_set_active_tab_idx(1);
+        w.remember_and_set_active_tab_idx(2);
+        assert!(w.can_step_history(-1));
+        assert!(!w.can_step_history(1));
+        assert_eq!(w.history_step(-1), Some(1));
+        assert_eq!(w.get_active_tab_idx(), 1);
+        assert_eq!(w.history_step(-1), Some(0));
+        assert_eq!(w.history_step(-1), None);
+        assert!(w.can_step_history(1));
+        assert_eq!(w.history_step(1), Some(1));
+        w.remember_and_set_active_tab_idx(3);
+        assert!(!w.can_step_history(1));
+        assert_eq!(w.history_step(-1), Some(1));
+        assert_eq!(w.history_step(-1), Some(0));
+        // ActivateLastTab still toggles with the tab we just left.
+        assert_eq!(w.get_last_active_tab_idx(), Some(1));
+    }
+
+    /// A closed tab drops out of the walk; its neighbours still connect.
+    #[test]
+    fn history_skips_closed_tabs() {
+        let mut w = window_with(3);
+        w.remember_and_set_active_tab_idx(1);
+        w.remember_and_set_active_tab_idx(2);
+        w.remove_tab_idx(1);
+        assert_eq!(w.get_active_tab_idx(), 1);
+        assert_eq!(w.history_step(-1), Some(0));
+        assert!(w.can_step_history(1));
+        assert_eq!(w.history_step(1), Some(1));
+        assert!(!w.can_step_history(1));
+    }
+
+    /// Re-activating the current tab, or a tab the window switched to on
+    /// its own (closing the active one), does not leave the walk stranded.
+    #[test]
+    fn history_tracks_where_the_window_actually_is() {
+        let mut w = window_with(3);
+        w.remember_and_set_active_tab_idx(1);
+        w.remember_and_set_active_tab_idx(1);
+        w.remove_tab_idx(1);
+        // The window moved to the next tab by itself (not a user step), so
+        // the history still ends at the closed tab: back goes to tab 0, and
+        // a fresh activation first records the tab we are really leaving.
+        assert_eq!(w.get_active_tab_idx(), 1);
+        assert_eq!(w.history_step(-1), Some(0));
+        assert_eq!(w.history_step(1), Some(1));
+        w.remember_and_set_active_tab_idx(0);
+        assert_eq!(w.history_step(-1), Some(1));
+        assert_eq!(w.history_step(-1), Some(0));
+        assert_eq!(w.history_step(-1), None);
     }
 }

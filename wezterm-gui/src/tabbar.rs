@@ -39,7 +39,20 @@ pub enum TabBarItem {
     NewTabButton,
     /// Opens the tab search dropdown; drawn at the right of a horizontal bar.
     TabSearch,
+    /// Browser-style back/forward through the tabs the window has shown;
+    /// `enabled` is false when that direction has nowhere to go.
+    History {
+        back: bool,
+        enabled: bool,
+    },
     WindowButton(IntegratedTitleButton),
+}
+
+/// Whether the back and forward history buttons have somewhere to go.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistoryNav {
+    pub back: bool,
+    pub forward: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -579,6 +592,7 @@ impl TabBarState {
         config: &ConfigHandle,
         left_status: &str,
         right_status: &str,
+        nav: HistoryNav,
         reuse: Option<&TabBarState>,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
@@ -714,6 +728,23 @@ impl TabBarState {
             });
             x += left_status_line.len();
             line.append_line(left_status_line, SEQ_ZERO);
+        }
+
+        // Back/forward buttons sit before the tabs, as in a browser.
+        if config.show_tab_history_buttons_in_tab_bar {
+            for (back, enabled) in [(true, nav.back), (false, nav.forward)] {
+                let text = if back { " ← " } else { " → " };
+                let button = parse_status_text(text, black_cell.attrs().clone());
+                let width = button.len();
+                line.append_line(button.clone(), SEQ_ZERO);
+                items.push(TabEntry {
+                    item: TabBarItem::History { back, enabled },
+                    title: button,
+                    x,
+                    width,
+                });
+                x += width;
+            }
         }
 
         for (tab_idx, tab_title) in tab_titles.iter().enumerate() {
@@ -1185,6 +1216,7 @@ mod tests {
             &config::configuration(),
             "",
             "",
+            HistoryNav::default(),
             reuse,
         )
     }
@@ -1272,17 +1304,24 @@ mod tests {
         config::use_this_lua_context_for_tests(install_counting_callback());
 
         let n = 7;
-        // tab0 is active and occupies x 0..4 ("tab0"); hover tab1 at x=5.
-        let state = build(Some(5), n);
-        let hovered = state
-            .items()
-            .iter()
-            .find(|i| matches!(i.item, TabBarItem::Tab { tab_idx: 1, .. }))
-            .expect("tab1 present");
+        // Find where tab1 sits (the history buttons precede the tabs), then
+        // hover it; the unhovered build costs n calls, the hovered n + 1.
+        let tab1 = |state: &TabBarState| {
+            state
+                .items()
+                .iter()
+                .find(|i| matches!(i.item, TabBarItem::Tab { tab_idx: 1, .. }))
+                .expect("tab1 present")
+                .clone()
+        };
+        let x = tab1(&build(None, n)).x;
+        let before = calls();
+        let state = build(Some(x), n);
+        let hovered = tab1(&state);
         assert!(
-            hovered.x <= 5 && 5 < hovered.x + hovered.width,
+            hovered.x <= x && x < hovered.x + hovered.width,
             "hover lands on tab1"
         );
-        assert_eq!(calls(), n + 1);
+        assert_eq!(calls() - before, n + 1);
     }
 }

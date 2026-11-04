@@ -2135,6 +2135,10 @@ impl TermWindow {
             } else {
                 (tabs.clone(), vec![])
             };
+        let nav = crate::tabbar::HistoryNav {
+            back: window.can_step_history(-1),
+            forward: window.can_step_history(1),
+        };
         let show_sub_tab_bar = !row_tabs.is_empty();
         if show_sub_tab_bar != self.show_sub_tab_bar {
             self.show_sub_tab_bar = show_sub_tab_bar;
@@ -2190,6 +2194,7 @@ impl TermWindow {
             &self.config,
             &self.left_status,
             &self.right_status,
+            nav,
             self.animation_frame_rebuild.then_some(&self.tab_bar),
         );
         if new_tab_bar != self.tab_bar {
@@ -2227,6 +2232,7 @@ impl TermWindow {
                 &self.config,
                 "",
                 "",
+                nav,
                 self.animation_frame_rebuild.then_some(&self.sub_tab_bar),
             )
         } else {
@@ -2446,18 +2452,37 @@ impl TermWindow {
             let changed = window.get_active_tab_idx() != tab_idx;
             window.remember_and_set_active_tab_idx(tab_idx);
             drop(window);
-
-            if let Some(pane) = self.get_active_pane_or_overlay() {
-                pane.focus_changed(true);
-                if changed {
-                    self.start_matrix_rain(prev_pane, &pane);
-                }
-            }
-
-            self.update_title();
-            self.update_scrollbar();
+            self.after_tab_activated(prev_pane, changed);
         }
         Ok(())
+    }
+
+    /// Browser-style back (`delta` < 0) or forward through the tabs this
+    /// window has shown. A dead end is a no-op.
+    fn activate_tab_history(&mut self, delta: isize) -> anyhow::Result<()> {
+        let prev_pane = self.get_active_pane_or_overlay();
+        let mux = Mux::get();
+        let mut window = mux
+            .get_window_mut(self.mux_window_id)
+            .ok_or_else(|| anyhow!("no such window"))?;
+        let stepped = window.history_step(delta).is_some();
+        drop(window);
+        if stepped {
+            self.after_tab_activated(prev_pane, true);
+        }
+        Ok(())
+    }
+
+    /// Focus, animation and bar refresh shared by every way of switching tab.
+    fn after_tab_activated(&mut self, prev_pane: Option<Arc<dyn Pane>>, changed: bool) {
+        if let Some(pane) = self.get_active_pane_or_overlay() {
+            pane.focus_changed(true);
+            if changed {
+                self.start_matrix_rain(prev_pane, &pane);
+            }
+        }
+        self.update_title();
+        self.update_scrollbar();
     }
 
     fn activate_tab_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {
@@ -3121,6 +3146,7 @@ impl TermWindow {
             ScrollToBottom => self.scroll_to_bottom(pane),
             ShowTabNavigator => self.show_tab_navigator(),
             ShowTabSearch => self.show_tab_search(),
+            ActivateTabHistory(delta) => self.activate_tab_history(*delta)?,
             ShowDebugOverlay => self.show_debug_overlay(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {

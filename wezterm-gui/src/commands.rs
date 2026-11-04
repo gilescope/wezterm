@@ -1681,6 +1681,33 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window", "Select Tab"],
             icon: Some("cod_list_flat"),
         },
+        ActivateTabHistory(-1) => CommandDef {
+            brief: "Back to the previous tab in history".into(),
+            doc: "Switches to the tab shown before this one, like a browser's back button".into(),
+            keys: vec![(Modifiers::SUPER, "[".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window", "Select Tab"],
+            icon: Some("md_arrow_left"),
+        },
+        ActivateTabHistory(1) => CommandDef {
+            brief: "Forward to the next tab in history".into(),
+            doc: "Returns to the tab left by going back, like a browser's forward button".into(),
+            keys: vec![(Modifiers::SUPER, "]".into())],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window", "Select Tab"],
+            icon: Some("md_arrow_right"),
+        },
+        ActivateTabHistory(n) => {
+            let (direction, amount) = if *n < 0 { ("back", -n) } else { ("forward", *n) };
+            CommandDef {
+                brief: format!("Go {direction} {amount} tabs in history").into(),
+                doc: format!("Walks {amount} steps {direction} through the tab history").into(),
+                keys: vec![],
+                args: &[ArgType::ActiveWindow],
+                menubar: &[],
+                icon: None,
+            }
+        }
         ShowTabSearch => CommandDef {
             brief: "Search tabs".into(),
             doc: "Type to fuzzy-match a tab by title, directory or program and switch to it".into(),
@@ -2205,6 +2232,8 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ShowLauncher,
         ShowTabNavigator,
         ShowTabSearch,
+        ActivateTabHistory(-1),
+        ActivateTabHistory(1),
         // ----------------- Help
         OpenUri("https://wezterm.org/".to_string()),
         OpenUri("https://github.com/wezterm/wezterm/discussions/".to_string()),

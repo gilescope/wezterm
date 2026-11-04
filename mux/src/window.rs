@@ -3,6 +3,7 @@ use crate::{Mux, MuxNotification, Tab, TabId};
 use config::GuiPosition;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 static WIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type WindowId = usize;
@@ -12,11 +13,15 @@ pub struct Window {
     tabs: Vec<Arc<Tab>>,
     active_tab_idx: usize,
     last_active_tab_id: Option<TabId>,
-    /// Tabs the user switched to, oldest first, by id so a reorder or a
+    /// Tabs the user looked at, oldest first, by id so a reorder or a
     /// close cannot point it at the wrong tab. `history_pos` is the entry
-    /// we are at; later entries are what "forward" returns to.
+    /// we are at; later entries are what "forward" returns to. A tab is
+    /// recorded when it is left, and only if it was active for
+    /// `history_dwell`: wheeling through the bar must not fill the list.
     tab_history: Vec<TabId>,
     history_pos: usize,
+    active_since: Instant,
+    history_dwell: Duration,
     workspace: String,
     title: String,
     initial_position: Option<GuiPosition>,
@@ -32,6 +37,8 @@ impl Window {
             last_active_tab_id: None,
             tab_history: vec![],
             history_pos: 0,
+            active_since: Instant::now(),
+            history_dwell: Duration::from_secs(1),
             title: String::new(),
             workspace: workspace.unwrap_or_else(|| Mux::get().active_workspace()),
             initial_position,
@@ -348,73 +355,66 @@ impl Window {
             return;
         }
         self.remember_current_as_last_active_tab();
-        self.record_history(idx);
+        if self.active_since.elapsed() >= self.history_dwell {
+            self.sync_history_to_active();
+        }
+        self.active_since = Instant::now();
         self.set_active_tab_idx_without_saving(idx);
+    }
+
+    #[cfg(test)]
+    pub fn set_history_dwell(&mut self, dwell: Duration) {
+        self.history_dwell = dwell;
     }
 
     /// Entries a walk keeps, oldest dropped first.
     const HISTORY_CAP: usize = 100;
 
-    /// Note a user switch to `idx` in the browser-style history: the forward
-    /// entries are dropped, as a browser does when you navigate afresh.
-    fn record_history(&mut self, idx: usize) {
-        self.sync_history_to_active();
-        if let Some(tab) = self.tabs.get(idx) {
-            self.push_history(tab.tab_id());
+    /// The history as it stands once the active tab is in it: a tab is
+    /// appended when it is left, so until then it only exists here. Also
+    /// where the window moved on its own (the active tab closed) catches up.
+    /// Appending drops the forward entries, as a browser does when you
+    /// navigate afresh.
+    fn synced_history(&self) -> (Vec<TabId>, usize) {
+        let mut hist = self.tab_history.clone();
+        let mut pos = self.history_pos;
+        if let Some(cur) = self.tabs.get(self.active_tab_idx).map(|t| t.tab_id()) {
+            if hist.get(pos) != Some(&cur) {
+                if !hist.is_empty() {
+                    hist.truncate(pos + 1);
+                }
+                hist.push(cur);
+                if hist.len() > Self::HISTORY_CAP {
+                    hist.remove(0);
+                }
+                pos = hist.len() - 1;
+            }
         }
+        (hist, pos)
     }
 
-    /// The window can move on its own (the active tab closed), so the entry
-    /// at `history_pos` is not always where we are. Splice the active tab in
-    /// after it, keeping the forward entries, so a walk from here includes
-    /// the tab being left.
     fn sync_history_to_active(&mut self) {
-        let Some(cur) = self.tabs.get(self.active_tab_idx).map(|t| t.tab_id()) else {
-            return;
-        };
-        if self.tab_history.get(self.history_pos) == Some(&cur) {
-            return;
-        }
-        if !self.tab_history.is_empty() {
-            self.history_pos += 1;
-        }
-        self.tab_history.insert(self.history_pos, cur);
-        if self.tab_history.len() > Self::HISTORY_CAP {
-            self.tab_history.remove(0);
-            self.history_pos -= 1;
-        }
-    }
-
-    fn push_history(&mut self, id: TabId) {
-        if !self.tab_history.is_empty() {
-            self.tab_history.truncate(self.history_pos + 1);
-        }
-        if self.tab_history.last() != Some(&id) {
-            self.tab_history.push(id);
-        }
-        if self.tab_history.len() > Self::HISTORY_CAP {
-            self.tab_history.remove(0);
-        }
-        self.history_pos = self.tab_history.len() - 1;
+        let (hist, pos) = self.synced_history();
+        self.tab_history = hist;
+        self.history_pos = pos;
     }
 
     /// The history position `delta` steps away (negative = back) that names
     /// a live tab other than the active one. Closed tabs stay in the list
     /// and are stepped over, so no pruning is needed.
     fn history_target(&self, delta: isize) -> Option<(usize, usize)> {
+        let (hist, mut pos) = self.synced_history();
         let step = delta.signum();
-        let mut pos = self.history_pos;
         for _ in 0..delta.unsigned_abs() {
             loop {
                 pos = pos.checked_add_signed(step)?;
-                let idx = self.get_tab_idx_for_id(*self.tab_history.get(pos)?);
-                match idx {
+                match self.get_tab_idx_for_id(*hist.get(pos)?) {
                     Some(idx) if idx != self.active_tab_idx => break,
                     _ => {}
                 }
             }
         }
-        let idx = self.get_tab_idx_for_id(self.tab_history[pos])?;
+        let idx = self.get_tab_idx_for_id(hist[pos])?;
         Some((pos, idx))
     }
 
@@ -429,6 +429,7 @@ impl Window {
         self.sync_history_to_active();
         let (pos, idx) = self.history_target(delta)?;
         self.history_pos = pos;
+        self.active_since = Instant::now();
         self.remember_current_as_last_active_tab();
         self.set_active_tab_idx_without_saving(idx);
         Some(idx)
@@ -653,14 +654,38 @@ mod test {
 #[cfg(test)]
 mod history_test {
     use super::*;
+    use std::time::Duration;
     use wezterm_term::TerminalSize;
 
+    /// Dwell is off so the walk itself can be checked step by step.
     fn window_with(n: usize) -> Window {
         let mut w = Window::new(Some("test".into()), None);
+        w.set_history_dwell(Duration::ZERO);
         for _ in 0..n {
             w.push_tab(&Arc::new(Tab::new(&TerminalSize::default())));
         }
         w
+    }
+
+    /// Wheeling through tabs must not fill the history: a tab counts only
+    /// once it has been looked at for the dwell time.
+    #[test]
+    fn history_skips_tabs_passed_through_quickly() {
+        let mut w = window_with(4);
+        let dwell = Duration::from_millis(20);
+        w.set_history_dwell(dwell);
+        std::thread::sleep(dwell * 5);
+        w.remember_and_set_active_tab_idx(1);
+        w.remember_and_set_active_tab_idx(2);
+        w.remember_and_set_active_tab_idx(3);
+        std::thread::sleep(dwell * 5);
+        w.remember_and_set_active_tab_idx(0);
+        assert_eq!(w.history_step(-1), Some(3));
+        assert_eq!(w.history_step(-1), Some(0));
+        assert_eq!(w.history_step(-1), None);
+        assert_eq!(w.history_step(1), Some(3));
+        assert_eq!(w.history_step(1), Some(0));
+        assert_eq!(w.history_step(1), None);
     }
 
     /// Back walks to earlier tabs, forward returns, and a fresh activation

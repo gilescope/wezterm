@@ -3,10 +3,12 @@
 {{since('nightly')}}
 
 Walks the window's tab history like a browser's back and forward buttons:
-every tab you switch to is appended, going back (negative `delta`) returns
+every tab you look at is appended, going back (negative `delta`) returns
 to the tab shown before, going forward (positive `delta`) returns to the one
 you went back from, and switching to a fresh tab drops the forward entries.
-Closed tabs are stepped over. At either end this has no effect.
+A tab counts as looked at once it has been active for a second, so wheeling
+or cycling through the bar does not fill the history with the tabs passed
+over. Closed tabs are stepped over. At either end this has no effect.
 
 The `←` and `→` buttons at the left of a horizontal tab bar (including the
 child row of a Left/Right bar) do the same with the mouse; see

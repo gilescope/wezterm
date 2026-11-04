@@ -2118,14 +2118,12 @@ impl TermWindow {
         // one whose block holds the active tab.
         let (bar_tabs, row_tabs): (Vec<TabInformation>, Vec<TabInformation>) =
             if tab_pos.is_vertical() && !tabs.is_empty() {
-                let active_idx = tabs.iter().position(|t| t.is_active).unwrap_or(0);
-                let root = window.root_idx_of(active_idx);
                 // The row shows even for a lone root: its `+` is the mouse
                 // way to open a child tab.
-                let block = root..window.children_of(root).end;
-                let row = tabs[block.clone()].to_vec();
-                let roots = window
-                    .root_indices()
+                let (root_indices, block) = window.bar_layout();
+                let root = block.start;
+                let row = tabs[block].to_vec();
+                let roots = root_indices
                     .into_iter()
                     .map(|i| {
                         let mut t = tabs[i].clone();
@@ -2447,7 +2445,6 @@ impl TermWindow {
         if tab_idx < max {
             let changed = window.get_active_tab_idx() != tab_idx;
             window.remember_and_set_active_tab_idx(tab_idx);
-
             drop(window);
 
             if let Some(pane) = self.get_active_pane_or_overlay() {

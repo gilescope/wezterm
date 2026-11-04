@@ -119,6 +119,14 @@ impl Window {
             .collect()
     }
 
+    /// What a vertical bar shows: the root indices for the side bar and the
+    /// active root's block (root plus its children) for the row across the
+    /// top. Indices are into this window's tab list.
+    pub fn bar_layout(&self) -> (Vec<usize>, Range<usize>) {
+        let root = self.root_idx_of(self.active_tab_idx);
+        (self.root_indices(), root..self.children_of(root).end)
+    }
+
     /// Make `tab_id` a child of `parent_id` and move it to the end of the
     /// parent's block. Returns its new index. A tab cannot nest under a
     /// child (one level only) or under itself.
@@ -520,5 +528,27 @@ mod test {
                 t[2].tab_id()
             ]
         );
+    }
+
+    /// A(a1 a2) B(b1) C: whichever tab is active, the row is its root's
+    /// block and the side bar's active root is that root.
+    #[test]
+    fn bar_layout_follows_the_active_tab() {
+        let (mut w, t) = window_with(3);
+        let (a1, a2, b1) = (tab(), tab(), tab());
+        for (child, root) in [(&a1, &t[0]), (&a2, &t[0]), (&b1, &t[1])] {
+            w.push_tab(child);
+            w.attach_tab_to_parent(child.tab_id(), root.tab_id());
+        }
+        // Order: A a1 a2 B b1 C
+        let expect = [(0, 0..3), (0, 0..3), (0, 0..3), (3, 3..5), (3, 3..5), (5, 5..6)];
+        for (idx, (root, block)) in expect.iter().enumerate() {
+            w.remember_and_set_active_tab_idx(idx);
+            let (roots, row) = w.bar_layout();
+            assert_eq!(roots, vec![0, 3, 5], "roots with tab {idx} active");
+            assert_eq!(w.root_idx_of(idx), *root, "root of tab {idx}");
+            assert_eq!(row, *block, "row block with tab {idx} active");
+            assert!(row.contains(&idx), "row holds the active tab {idx}");
+        }
     }
 }

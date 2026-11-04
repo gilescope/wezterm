@@ -33,6 +33,9 @@ As features stabilize some brief notes about them will accumulate here.
 * Tab search: [ShowTabSearch](config/lua/keyassignment/ShowTabSearch.md)
   (`SUPER+SHIFT+f`, or the `⌕ search` box at the right of the tab bar) drops
   down a fuzzy-matched list of the window's tabs to switch to.
+* Tab history: [ActivateTabHistory](config/lua/keyassignment/ActivateTabHistory.md)
+  (`SUPER+[` / `SUPER+]`, or the `←` `→` buttons at the left of the tab bar)
+  walks back and forward through the tabs you switched to, like a browser.
 * Nested tabs: [SpawnChildTab](config/lua/keyassignment/SpawnChildTab.md)
   opens a tab under the current tab's root. With a Left/Right tab bar the
   side bar lists roots and the active root's children appear in a row across

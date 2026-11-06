@@ -6,7 +6,27 @@ use mux::Mux;
 use std::sync::Arc;
 use window::{Clipboard, WindowOps};
 
+/// CSI u encoding of a key held with super (cmd). The legacy encoding has
+/// no way to say super and would type a bare `c`; termwiz's CSI u drops it
+/// too (`Modifiers::encode_xterm` stops at ctrl). 9 is 1 + the super bit.
+fn csi_u_super(c: char) -> String {
+    format!("\x1b[{};9u", u32::from(c))
+}
+
 impl TermWindow {
+    /// Copy with nothing selected while the app has grabbed the mouse: the
+    /// selection the user sees is the app's (claude code keeps its own and
+    /// copies it on cmd-c), so hand it the keystroke rather than wiping the
+    /// clipboard with an empty string.
+    pub fn copy_selection_or_forward(&self, pane: &Arc<dyn Pane>, dest: ClipboardCopyDestination) {
+        let text = self.selection_text(pane);
+        if text.is_empty() && pane.is_mouse_grabbed() {
+            pane.writer().write_all(csi_u_super('c').as_bytes()).ok();
+        } else {
+            self.copy_to_clipboard(dest, text);
+        }
+    }
+
     pub fn copy_to_clipboard(&self, clipboard: ClipboardCopyDestination, text: String) {
         let clipboard = match clipboard {
             ClipboardCopyDestination::Clipboard => [Some(Clipboard::Clipboard), None],
@@ -56,5 +76,16 @@ impl TermWindow {
         })
         .detach();
         self.maybe_scroll_to_bottom_for_input(&pane);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn super_c_is_csi_u_with_the_super_bit() {
+        // What claude code's key parser decodes as `cmd+c`.
+        assert_eq!(csi_u_super('c'), "\x1b[99;9u");
     }
 }

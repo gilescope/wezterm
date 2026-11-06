@@ -3075,10 +3075,7 @@ impl TermWindow {
                 let window = self.window.clone().unwrap();
                 window.set_window_level(level.clone());
             }
-            CopyTo(dest) => {
-                let text = self.selection_text(pane);
-                self.copy_to_clipboard(*dest, text);
-            }
+            CopyTo(dest) => self.copy_selection_or_forward(pane, *dest),
             CopyTextTo { text, destination } => {
                 self.copy_to_clipboard(*destination, text.clone());
             }

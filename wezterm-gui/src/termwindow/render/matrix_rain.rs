@@ -59,6 +59,19 @@ const EGG_RISE: f32 = 0.22;
 const EGG_HOLD: f32 = 0.40;
 const EGG_FALL: f32 = 0.22;
 
+/// Resume card: decode in, hold until dismissed, dissolve out. Its own
+/// clock, since it outlives the transition.
+const CARD_RISE_MS: f32 = 600.0;
+const CARD_FALL_MS: f32 = 450.0;
+
+/// Where an egg is in its life; the fraction runs 0 → 1 within the phase.
+#[derive(Clone, Copy)]
+enum EggPhase {
+    Rise(f32),
+    Hold,
+    Fall(f32),
+}
+
 /// Iconic film lines, hidden in plain sight in the rain.
 const QUOTES: &[&str] = &[
     "Wake up, Neo...",
@@ -108,7 +121,12 @@ struct Egg {
 impl Egg {
     /// Lay a (possibly multi-line) quote out centred in the pane grid.
     fn from_quote(text: &str, cols: usize, rows: usize) -> Egg {
-        let lines: Vec<&str> = text.split('\n').collect();
+        Self::from_lines(&text.split('\n').collect::<Vec<_>>(), cols, rows, true)
+    }
+
+    /// A block of lines centred in the grid; each line centred within the
+    /// block (`centre`) or left-aligned, as a card wants.
+    fn from_lines(lines: &[&str], cols: usize, rows: usize, centre: bool) -> Egg {
         let fw = lines
             .iter()
             .map(|l| l.chars().count())
@@ -119,7 +137,11 @@ impl Egg {
         let mut glyphs = vec![0u32; fw * fh];
         for (r, line) in lines.iter().enumerate() {
             // Centre each line within the block so multi-line quotes look tidy.
-            let off = (fw - line.chars().count()) / 2;
+            let off = if centre {
+                (fw - line.chars().count()) / 2
+            } else {
+                0
+            };
             for (c, ch) in line.chars().enumerate() {
                 if ch != ' ' {
                     glyphs[r * fw + off + c] = ch as u32;
@@ -133,6 +155,37 @@ impl Egg {
             fh,
             glyphs,
         }
+    }
+}
+
+/// Shaped glyphs per grapheme, filled lazily; `None` is an undrawable one.
+type GlyphMemo = RefCell<HashMap<String, Option<GlyphInfo>>>;
+
+/// A resume card drawn as an egg on its own clock: matrixes in, stays
+/// until dismissed, then matrixes out. A dark backing keeps it readable
+/// over the pane, since no rain is streaming behind it.
+pub struct ResumeCardAnim {
+    start: Instant,
+    dismissed: Option<Instant>,
+    pane_id: PaneId,
+    cols: usize,
+    rows: usize,
+    egg: Egg,
+    glyphs: GlyphMemo,
+}
+
+impl ResumeCardAnim {
+    fn phase(&self) -> Option<EggPhase> {
+        if let Some(at) = self.dismissed {
+            let f = at.elapsed().as_secs_f32() * 1000.0 / CARD_FALL_MS;
+            return (f < 1.0).then_some(EggPhase::Fall(f));
+        }
+        let f = self.start.elapsed().as_secs_f32() * 1000.0 / CARD_RISE_MS;
+        Some(if f < 1.0 {
+            EggPhase::Rise(f)
+        } else {
+            EggPhase::Hold
+        })
     }
 }
 
@@ -151,8 +204,7 @@ pub struct TabSwitchAnim {
     /// is skipped entirely.
     depth: Vec<i32>,
     /// Memoised shaping of each real grapheme, filled lazily as cells resolve.
-    /// `None` records a grapheme that has no drawable glyph (blank/unshaped).
-    glyphs: RefCell<HashMap<String, Option<GlyphInfo>>>,
+    glyphs: GlyphMemo,
     /// Easter-egg film quote to decode mid-transition, if this switch rolled
     /// one. It plays within the normal duration; the rain never pauses.
     egg: Option<Egg>,
@@ -268,19 +320,185 @@ impl crate::TermWindow {
     /// Look up a real grapheme's glyph from the per-animation memo, shaping it
     /// on first sight (subject to a per-frame budget). Returns `None` for
     /// blanks, undrawable glyphs, or when the budget is spent this frame.
-    fn memo_glyph(&self, anim: &TabSwitchAnim, s: &str, budget: &mut i32) -> Option<GlyphInfo> {
+    fn memo_glyph(&self, memo: &GlyphMemo, s: &str, budget: &mut i32) -> Option<GlyphInfo> {
         if s.is_empty() || s == " " {
             return None;
         }
-        if !anim.glyphs.borrow().contains_key(s) {
+        if !memo.borrow().contains_key(s) {
             if *budget <= 0 {
                 return None;
             }
             let shaped = self.shape_grapheme(s);
-            anim.glyphs.borrow_mut().insert(s.to_string(), shaped);
+            memo.borrow_mut().insert(s.to_string(), shaped);
             *budget -= 1;
         }
-        anim.glyphs.borrow().get(s).and_then(|o| o.clone())
+        memo.borrow().get(s).and_then(|o| o.clone())
+    }
+
+    pub fn resume_card_pane_id(&self) -> Option<PaneId> {
+        self.resume_card.as_ref().map(|a| a.pane_id)
+    }
+
+    /// Show `lines` as a card over the active pane, matrixing in. Replaces
+    /// any card already up.
+    pub fn show_resume_card(&mut self, lines: Vec<String>) {
+        let pane = match self.get_active_pane_or_overlay() {
+            Some(p) => p,
+            None => return,
+        };
+        let dims = pane.get_dimensions();
+        let (cols, rows) = (dims.cols, dims.viewport_rows);
+        if cols == 0 || rows == 0 || lines.is_empty() {
+            return;
+        }
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        self.resume_card = Some(ResumeCardAnim {
+            start: Instant::now(),
+            dismissed: None,
+            pane_id: pane.pane_id(),
+            cols,
+            rows,
+            egg: Egg::from_lines(&lines, cols, rows, false),
+            glyphs: RefCell::new(HashMap::new()),
+        });
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// Start the card dissolving. A no-op without a card, or if it already is.
+    pub fn dismiss_resume_card(&mut self) {
+        if let Some(card) = self.resume_card.as_mut() {
+            if card.dismissed.is_none() {
+                card.dismissed = Some(Instant::now());
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+        }
+    }
+
+    /// Drop the card outright, as a tab change does.
+    pub fn clear_resume_card(&mut self) {
+        self.resume_card = None;
+    }
+
+    /// Paint one frame of the resume card over the active pane. Frames are
+    /// only scheduled while it is rising or falling; the hold is static.
+    pub fn paint_resume_card(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        pane_left: usize,
+        pane_top: usize,
+        pane_cols: usize,
+        pane_rows: usize,
+    ) -> anyhow::Result<()> {
+        let phase = match self.resume_card.as_ref().and_then(|c| c.phase()) {
+            Some(phase) => phase,
+            None => {
+                if self.resume_card.take().is_some() {
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                }
+                return Ok(());
+            }
+        };
+        if !matches!(phase, EggPhase::Hold) {
+            self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(16)));
+        }
+        let card = self.resume_card.take().unwrap();
+        let palette = match self.matrix_rain_palette.take() {
+            Some(p) => p,
+            None => self.shape_matrix_palette().unwrap_or_default(),
+        };
+        let result = self.paint_resume_card_inner(
+            layers, &card, &palette, phase, pane_left, pane_top, pane_cols, pane_rows,
+        );
+        self.matrix_rain_palette = Some(palette);
+        self.resume_card = Some(card);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_resume_card_inner(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        card: &ResumeCardAnim,
+        palette: &[GlyphInfo],
+        phase: EggPhase,
+        pane_left: usize,
+        pane_top: usize,
+        pane_cols: usize,
+        pane_rows: usize,
+    ) -> anyhow::Result<()> {
+        let cols = card.cols.min(pane_cols);
+        let rows = card.rows.min(pane_rows);
+        if cols == 0 || rows == 0 {
+            return Ok(());
+        }
+        let cell_w = self.render_metrics.cell_size.width as f32;
+        let cell_h = self.render_metrics.cell_size.height as f32;
+        let (ox, oy) = self.matrix_pane_origin(pane_left, pane_top);
+        let left_off = self.dimensions.pixel_width as f32 / 2.0;
+        let top_off = self.dimensions.pixel_height as f32 / 2.0;
+        let quantum = (card.start.elapsed().as_secs_f32() * 1000.0 / 60.0) as u32;
+
+        let config = self.config.clone();
+        let attrs = CellAttributes::default();
+        let style = self.fonts.match_style(&config, &attrs).clone();
+        let font = self.fonts.default_font()?;
+        let matrix_style = Self::matrix_text_style();
+        let matrix_font = self.matrix_font()?;
+        let gl_state = self.render_state.as_ref().unwrap();
+        let mut glyph_cache = gl_state.glyph_cache.borrow_mut();
+        let mut shape_budget = 96i32;
+
+        // Backing: a cell of margin round the block, fading with the phase.
+        let strength = match phase {
+            EggPhase::Rise(f) => f,
+            EggPhase::Hold => 1.0,
+            EggPhase::Fall(f) => 1.0 - f,
+        };
+        let egg = &card.egg;
+        let x0 = (egg.x0 - 1).max(0) as f32;
+        let x1 = (egg.x0 + egg.fw as i32 + 1).min(cols as i32) as f32;
+        let y0 = (egg.y0 - 1).max(0) as f32;
+        let y1 = (egg.y0 + egg.fh as i32 + 1).min(rows as i32) as f32;
+        self.filled_rectangle(
+            layers,
+            LAYER,
+            euclid::rect(
+                ox + x0 * cell_w - left_off,
+                oy + y0 * cell_h - top_off,
+                (x1 - x0) * cell_w,
+                (y1 - y0) * cell_h,
+            ),
+            LinearRgba::with_components(0.0, 0.03, 0.01, 0.9 * strength),
+        )?;
+
+        self.paint_egg(
+            layers,
+            &mut glyph_cache,
+            &card.glyphs,
+            &mut shape_budget,
+            egg,
+            phase,
+            palette,
+            quantum,
+            &style,
+            &font,
+            &matrix_style,
+            &matrix_font,
+            ox,
+            oy,
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+            left_off,
+            top_off,
+        )
     }
 
     /// Shape a single grapheme to its leading glyph, or `None` if it has no
@@ -573,7 +791,7 @@ impl crate::TermWindow {
                         continue; // off the bottom of the changed region
                     }
                     let s = anim.old_cells[r as usize * anim.cols + c].clone();
-                    if let Some(info) = self.memo_glyph(anim, &s, &mut shape_budget) {
+                    if let Some(info) = self.memo_glyph(&anim.glyphs, &s, &mut shape_budget) {
                         let g = 0.40 + 0.55 * (yrow / (cd.depth as f32 + 1.0)).clamp(0.0, 1.0);
                         let color = LinearRgba::with_components(0.0, g, 0.12 * g, 1.0);
                         self.emit_matrix_glyph(
@@ -604,7 +822,7 @@ impl crate::TermWindow {
             // front. Skip while the front is still above the top edge.
             if r >= 0 && r <= cd.depth && cd.settle >= 0.0 {
                 let s = anim.cells[r as usize * anim.cols + c].clone();
-                if let Some(info) = self.memo_glyph(anim, &s, &mut shape_budget) {
+                if let Some(info) = self.memo_glyph(&anim.glyphs, &s, &mut shape_budget) {
                     let color = LinearRgba::with_components(0.80, 1.0, 0.85, 1.0);
                     self.emit_matrix_glyph(
                         layers,
@@ -670,13 +888,21 @@ impl crate::TermWindow {
         let egg_t0 = EGG_MIDPOINT - egg_total / 2.0;
         if let Some(egg) = anim.egg.as_ref() {
             if p >= egg_t0 && p <= egg_t0 + egg_total {
+                let local = p - egg_t0;
+                let phase = if local < EGG_RISE {
+                    EggPhase::Rise(local / EGG_RISE)
+                } else if local < EGG_RISE + EGG_HOLD {
+                    EggPhase::Hold
+                } else {
+                    EggPhase::Fall((local - EGG_RISE - EGG_HOLD) / EGG_FALL)
+                };
                 self.paint_egg(
                     layers,
                     &mut glyph_cache,
-                    anim,
+                    &anim.glyphs,
                     &mut shape_budget,
                     egg,
-                    p,
+                    phase,
                     palette,
                     quantum,
                     &style,
@@ -708,10 +934,10 @@ impl crate::TermWindow {
         &self,
         layers: &mut TripleLayerQuadAllocator,
         glyph_cache: &mut crate::glyphcache::GlyphCache,
-        anim: &TabSwitchAnim,
+        memo: &GlyphMemo,
         shape_budget: &mut i32,
         egg: &Egg,
-        p: f32,
+        phase: EggPhase,
         palette: &[GlyphInfo],
         quantum: u32,
         style: &config::TextStyle,
@@ -730,18 +956,10 @@ impl crate::TermWindow {
         // Length (in figure rows) of the flickering decode band at each front.
         const LEAD: f32 = 5.0;
         let span = egg.fh as f32 + LEAD;
-        // Local time within the egg: rise (matrix in), hold (linger), fall (out).
-        let t0 = EGG_MIDPOINT - (EGG_RISE + EGG_HOLD + EGG_FALL) / 2.0;
-        let local = p - t0;
-        let (building, front) = if local < EGG_RISE {
-            (true, (local / EGG_RISE).clamp(0.0, 1.0) * span)
-        } else if local < EGG_RISE + EGG_HOLD {
-            (true, span) // hold: fully settled
-        } else {
-            (
-                false,
-                ((local - EGG_RISE - EGG_HOLD) / EGG_FALL).clamp(0.0, 1.0) * span,
-            )
+        let (building, front) = match phase {
+            EggPhase::Rise(f) => (true, f.clamp(0.0, 1.0) * span),
+            EggPhase::Hold => (true, span), // fully settled
+            EggPhase::Fall(f) => (false, f.clamp(0.0, 1.0) * span),
         };
 
         for fr in 0..egg.fh {
@@ -791,7 +1009,7 @@ impl crate::TermWindow {
                         let glyph = char::from_u32(code).unwrap_or('\u{2588}');
                         let mut buf = [0u8; 4];
                         let g = glyph.encode_utf8(&mut buf);
-                        if let Some(info) = self.memo_glyph(anim, g, shape_budget) {
+                        if let Some(info) = self.memo_glyph(memo, g, shape_budget) {
                             self.emit_matrix_glyph(
                                 layers,
                                 glyph_cache,

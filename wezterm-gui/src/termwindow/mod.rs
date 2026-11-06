@@ -26,7 +26,6 @@ use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
 };
-use crate::termwindow::resumecard::ResumeCard;
 use crate::termwindow::webgpu::WebGpuState;
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
@@ -84,7 +83,6 @@ pub mod paneselect;
 mod prevcursor;
 pub mod render;
 pub mod resize;
-pub mod resumecard;
 mod selection;
 pub mod spawn;
 pub mod tabsearch;
@@ -443,6 +441,8 @@ pub struct TermWindow {
     tab_bar_width_override: Option<f32>,
     /// Active matrix-rain tab-switch transition, if any.
     tab_switch_anim: Option<crate::termwindow::render::matrix_rain::TabSwitchAnim>,
+    /// Resume card shown over the active pane; see `matrix_rain.rs`.
+    resume_card: Option<crate::termwindow::render::matrix_rain::ResumeCardAnim>,
     /// Lazily-shaped katakana/digit glyph palette for the matrix rain.
     matrix_rain_palette: Option<Vec<wezterm_font::GlyphInfo>>,
     pub right_status: String,
@@ -794,6 +794,7 @@ impl TermWindow {
             tab_bar_scroll_offset: std::cell::Cell::new(0.),
             tab_bar_width_override: None,
             tab_switch_anim: None,
+            resume_card: None,
             matrix_rain_palette: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -2481,9 +2482,7 @@ impl TermWindow {
             pane.focus_changed(true);
             if changed {
                 // A card belongs to the tab it was shown on.
-                if self.get_modal().map_or(false, |m| m.is::<ResumeCard>()) {
-                    self.cancel_modal();
-                }
+                self.clear_resume_card();
                 self.start_matrix_rain(prev_pane, &pane);
                 let away = {
                     let mux = Mux::get();
@@ -2523,11 +2522,6 @@ impl TermWindow {
             },
         ))
         .detach();
-    }
-
-    /// Show a resume card over the pane; see `resumecard.rs`.
-    pub fn show_resume_card(&mut self, lines: Vec<String>) {
-        self.set_modal(Rc::new(ResumeCard::new(lines)));
     }
 
     fn activate_tab_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {

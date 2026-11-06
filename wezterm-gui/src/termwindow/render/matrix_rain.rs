@@ -65,9 +65,11 @@ const CARD_RISE_MS: f32 = 600.0;
 const CARD_FALL_MS: f32 = 450.0;
 
 /// Settled text colours: the film quote flashes white-green; the card is
-/// read for seconds, so it gets the softer phosphor green.
+/// read for seconds, so it gets a muted green on an off-black backing.
+/// Bright-on-pure-black halates on an LCD, and poor vision feels it most.
 const QUOTE_TEXT: LinearRgba = LinearRgba::with_components(0.85, 1.0, 0.88, 1.0);
-const CARD_TEXT: LinearRgba = LinearRgba::with_components(0.30, 0.85, 0.42, 1.0);
+const CARD_TEXT: LinearRgba = LinearRgba::with_components(0.45, 0.78, 0.50, 1.0);
+const CARD_BACKING: LinearRgba = LinearRgba::with_components(0.07, 0.09, 0.07, 1.0);
 
 /// Where an egg is in its life; the fraction runs 0 → 1 within the phase.
 #[derive(Clone, Copy)]
@@ -479,7 +481,7 @@ impl crate::TermWindow {
                 (x1 - x0) * cell_w,
                 (y1 - y0) * cell_h,
             ),
-            LinearRgba::with_components(0.0, 0.03, 0.01, 0.9 * strength),
+            CARD_BACKING.mul_alpha(0.96 * strength),
         )?;
 
         self.paint_egg(

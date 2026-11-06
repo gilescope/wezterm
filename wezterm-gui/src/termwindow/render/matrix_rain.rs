@@ -64,6 +64,11 @@ const EGG_FALL: f32 = 0.22;
 const CARD_RISE_MS: f32 = 600.0;
 const CARD_FALL_MS: f32 = 450.0;
 
+/// Settled text colours: the film quote flashes white-green; the card is
+/// read for seconds, so it gets the softer phosphor green.
+const QUOTE_TEXT: LinearRgba = LinearRgba::with_components(0.85, 1.0, 0.88, 1.0);
+const CARD_TEXT: LinearRgba = LinearRgba::with_components(0.30, 0.85, 0.42, 1.0);
+
 /// Where an egg is in its life; the fraction runs 0 → 1 within the phase.
 #[derive(Clone, Copy)]
 enum EggPhase {
@@ -484,6 +489,7 @@ impl crate::TermWindow {
             &mut shape_budget,
             egg,
             phase,
+            CARD_TEXT,
             palette,
             quantum,
             &style,
@@ -950,6 +956,7 @@ impl crate::TermWindow {
                     &mut shape_budget,
                     egg,
                     phase,
+                    QUOTE_TEXT,
                     palette,
                     quantum,
                     &style,
@@ -985,6 +992,7 @@ impl crate::TermWindow {
         shape_budget: &mut i32,
         egg: &Egg,
         phase: EggPhase,
+        text: LinearRgba,
         palette: &[GlyphInfo],
         quantum: u32,
         style: &config::TextStyle,
@@ -1051,8 +1059,7 @@ impl crate::TermWindow {
 
                 match state {
                     Cell::Settled => {
-                        // Settled quote character in bright white-green.
-                        let color = LinearRgba::with_components(0.85, 1.0, 0.88, 1.0);
+                        let color = text;
                         let glyph = char::from_u32(code).unwrap_or('\u{2588}');
                         let mut buf = [0u8; 4];
                         let g = glyph.encode_utf8(&mut buf);

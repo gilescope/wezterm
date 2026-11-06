@@ -26,6 +26,7 @@ use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
 };
+use crate::termwindow::resumecard::ResumeCard;
 use crate::termwindow::webgpu::WebGpuState;
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
@@ -83,6 +84,7 @@ pub mod paneselect;
 mod prevcursor;
 pub mod render;
 pub mod resize;
+pub mod resumecard;
 mod selection;
 pub mod spawn;
 pub mod tabsearch;
@@ -2478,11 +2480,54 @@ impl TermWindow {
         if let Some(pane) = self.get_active_pane_or_overlay() {
             pane.focus_changed(true);
             if changed {
+                // A card belongs to the tab it was shown on.
+                if self.get_modal().map_or(false, |m| m.is::<ResumeCard>()) {
+                    self.cancel_modal();
+                }
                 self.start_matrix_rain(prev_pane, &pane);
+                let away = {
+                    let mux = Mux::get();
+                    let window = mux.get_window(self.mux_window_id);
+                    window
+                        .as_ref()
+                        .and_then(|w| w.get_active_tab().and_then(|t| w.time_away(t.tab_id())))
+                };
+                self.emit_tab_activated(pane.pane_id(), away);
             }
         }
         self.update_title();
         self.update_scrollbar();
+    }
+
+    /// `tab-activated` Lua event: `(window, pane, away_secs)`, where
+    /// `away_secs` is nil for a tab never left. Not coalesced like the
+    /// status events: one switch, one call.
+    fn emit_tab_activated(&mut self, pane_id: PaneId, away: Option<Duration>) {
+        if self.window.is_none() {
+            return;
+        }
+        let window = GuiWin::new(self);
+        let pane = MuxPane(pane_id);
+        let away_secs = away.map(|d| d.as_secs_f64());
+        promise::spawn::spawn(config::with_lua_config_on_main_thread(
+            move |lua| async move {
+                if let Some(lua) = lua {
+                    let args = lua.pack_multi((window, pane, away_secs))?;
+                    if let Err(err) =
+                        config::lua::emit_event(&lua, ("tab-activated".to_string(), args)).await
+                    {
+                        log::error!("while processing tab-activated event: {err:#}");
+                    }
+                }
+                Ok(())
+            },
+        ))
+        .detach();
+    }
+
+    /// Show a resume card over the pane; see `resumecard.rs`.
+    pub fn show_resume_card(&mut self, lines: Vec<String>) {
+        self.set_modal(Rc::new(ResumeCard::new(lines)));
     }
 
     fn activate_tab_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {

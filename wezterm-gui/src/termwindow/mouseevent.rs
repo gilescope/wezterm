@@ -71,6 +71,15 @@ impl super::TermWindow {
 
         self.current_mouse_event.replace(event.clone());
 
+        // A click anywhere dismisses a resume card and still lands.
+        if matches!(event.kind, WMEK::Press(_))
+            && self.get_modal().map_or(false, |m| {
+                m.is::<crate::termwindow::resumecard::ResumeCard>()
+            })
+        {
+            self.cancel_modal();
+        }
+
         let border = self.get_os_border();
 
         // Both bars can be present at once (side bar + child row), so take

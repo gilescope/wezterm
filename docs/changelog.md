@@ -39,6 +39,11 @@ As features stabilize some brief notes about them will accumulate here.
 * `SUPER+c` with nothing selected in a pane whose program has grabbed the
   mouse is passed to that program as CSI u `cmd+c` instead of emptying the
   clipboard, so a TUI that keeps its own selection (claude code) copies it.
+* Resume card: the [tab-activated](config/lua/window-events/tab-activated.md)
+  event reports how long a tab was left for, and
+  [window:show_card()](config/lua/window/show_card.md) draws a dismissable
+  text card over the pane, so a tab you come back to after a while can say
+  what it is about.
 * Nested tabs: [SpawnChildTab](config/lua/keyassignment/SpawnChildTab.md)
   opens a tab under the current tab's root. With a Left/Right tab bar the
   side bar lists roots and the active root's children appear in a row across

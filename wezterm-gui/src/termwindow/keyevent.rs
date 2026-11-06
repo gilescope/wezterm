@@ -269,6 +269,8 @@ impl super::TermWindow {
         }
 
         if is_down {
+            // Any key dismisses a resume card and still goes where it was going.
+            self.dismiss_resume_card();
             if only_key_bindings == OnlyKeyBindings::No {
                 if let Some(modal) = self.get_modal() {
                     if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {

@@ -95,6 +95,13 @@ impl UserData for GuiWin {
                 Ok(())
             },
         );
+        methods.add_method("show_card", |_, this, lines: Vec<String>| {
+            this.window
+                .notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                    tw.show_resume_card(lines)
+                })));
+            Ok(())
+        });
         methods.add_method("get_appearance", |_, _, _: ()| {
             Ok(Connection::get().unwrap().get_appearance().to_string())
         });

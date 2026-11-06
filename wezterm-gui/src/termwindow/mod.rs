@@ -441,6 +441,8 @@ pub struct TermWindow {
     tab_bar_width_override: Option<f32>,
     /// Active matrix-rain tab-switch transition, if any.
     tab_switch_anim: Option<crate::termwindow::render::matrix_rain::TabSwitchAnim>,
+    /// Resume card shown over the active pane; see `matrix_rain.rs`.
+    resume_card: Option<crate::termwindow::render::matrix_rain::ResumeCardAnim>,
     /// Lazily-shaped katakana/digit glyph palette for the matrix rain.
     matrix_rain_palette: Option<Vec<wezterm_font::GlyphInfo>>,
     pub right_status: String,
@@ -792,6 +794,7 @@ impl TermWindow {
             tab_bar_scroll_offset: std::cell::Cell::new(0.),
             tab_bar_width_override: None,
             tab_switch_anim: None,
+            resume_card: None,
             matrix_rain_palette: None,
             right_status: String::new(),
             left_status: String::new(),
@@ -2478,11 +2481,47 @@ impl TermWindow {
         if let Some(pane) = self.get_active_pane_or_overlay() {
             pane.focus_changed(true);
             if changed {
+                // A card belongs to the tab it was shown on.
+                self.clear_resume_card();
                 self.start_matrix_rain(prev_pane, &pane);
+                let away = {
+                    let mux = Mux::get();
+                    let window = mux.get_window(self.mux_window_id);
+                    window
+                        .as_ref()
+                        .and_then(|w| w.get_active_tab().and_then(|t| w.time_away(t.tab_id())))
+                };
+                self.emit_tab_activated(pane.pane_id(), away);
             }
         }
         self.update_title();
         self.update_scrollbar();
+    }
+
+    /// `tab-activated` Lua event: `(window, pane, away_secs)`, where
+    /// `away_secs` is nil for a tab never left. Not coalesced like the
+    /// status events: one switch, one call.
+    fn emit_tab_activated(&mut self, pane_id: PaneId, away: Option<Duration>) {
+        if self.window.is_none() {
+            return;
+        }
+        let window = GuiWin::new(self);
+        let pane = MuxPane(pane_id);
+        let away_secs = away.map(|d| d.as_secs_f64());
+        promise::spawn::spawn(config::with_lua_config_on_main_thread(
+            move |lua| async move {
+                if let Some(lua) = lua {
+                    let args = lua.pack_multi((window, pane, away_secs))?;
+                    if let Err(err) =
+                        config::lua::emit_event(&lua, ("tab-activated".to_string(), args)).await
+                    {
+                        log::error!("while processing tab-activated event: {err:#}");
+                    }
+                }
+                Ok(())
+            },
+        ))
+        .detach();
     }
 
     fn activate_tab_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {

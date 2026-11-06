@@ -624,6 +624,53 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Emit one glyph quad at cell (col, row) placed on the text baseline, as
+    /// the pane renderer does, so a line of prose reads as a line of prose.
+    /// (`emit_matrix_glyph` centres each bitmap in its cell, which is right
+    /// for the stream and wrong for text: letters of different heights hop.)
+    #[allow(clippy::too_many_arguments)]
+    fn emit_text_glyph(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        glyph_cache: &mut crate::glyphcache::GlyphCache,
+        info: &GlyphInfo,
+        style: &config::TextStyle,
+        font: &std::rc::Rc<wezterm_font::LoadedFont>,
+        metrics: &crate::utilsprites::RenderMetrics,
+        ox: f32,
+        oy: f32,
+        cell_w: f32,
+        cell_h: f32,
+        col: usize,
+        row: usize,
+        color: LinearRgba,
+        left_off: f32,
+        top_off: f32,
+    ) -> anyhow::Result<()> {
+        let glyph = glyph_cache.cached_glyph(info, style, false, font, metrics, 1)?;
+        let texture = match glyph.texture.as_ref() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let gw = texture.coords.size.width as f32 * glyph.scale as f32;
+        let gh = texture.coords.size.height as f32 * glyph.scale as f32;
+        let gx = ox + col as f32 * cell_w + (glyph.x_offset + glyph.bearing_x).get() as f32;
+        let gy = oy + row as f32 * cell_h + cell_h + metrics.descender.get() as f32
+            - (glyph.y_offset + glyph.bearing_y).get() as f32;
+        let mut quad = layers.allocate(LAYER)?;
+        quad.set_position(
+            gx - left_off,
+            gy - top_off,
+            gx + gw - left_off,
+            gy + gh - top_off,
+        );
+        quad.set_fg_color(color);
+        quad.set_texture(texture.texture_coords());
+        quad.set_has_color(glyph.has_color);
+        quad.set_hsv(None);
+        Ok(())
+    }
+
     /// Paint one frame of the transition over the active pane and schedule the
     /// next frame. Clears the animation state once it has run its course.
     pub fn paint_matrix_rain(
@@ -1010,7 +1057,7 @@ impl crate::TermWindow {
                         let mut buf = [0u8; 4];
                         let g = glyph.encode_utf8(&mut buf);
                         if let Some(info) = self.memo_glyph(memo, g, shape_budget) {
-                            self.emit_matrix_glyph(
+                            self.emit_text_glyph(
                                 layers,
                                 glyph_cache,
                                 &info,
@@ -1022,9 +1069,8 @@ impl crate::TermWindow {
                                 cell_w,
                                 cell_h,
                                 cc as usize,
-                                rr as f32,
+                                rr as usize,
                                 color,
-                                1.0,
                                 left_off,
                                 top_off,
                             )?;

@@ -36,6 +36,9 @@ As features stabilize some brief notes about them will accumulate here.
 * Tab history: [ActivateTabHistory](config/lua/keyassignment/ActivateTabHistory.md)
   (`SUPER+[` / `SUPER+]`, or the `←` `→` buttons at the left of the tab bar)
   walks back and forward through the tabs you switched to, like a browser.
+* `SUPER+c` with nothing selected in a pane whose program has grabbed the
+  mouse is passed to that program as CSI u `cmd+c` instead of emptying the
+  clipboard, so a TUI that keeps its own selection (claude code) copies it.
 * Nested tabs: [SpawnChildTab](config/lua/keyassignment/SpawnChildTab.md)
   opens a tab under the current tab's root. With a Left/Right tab bar the
   side bar lists roots and the active root's children appear in a row across

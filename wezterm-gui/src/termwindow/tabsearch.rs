@@ -11,15 +11,21 @@ use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
-use crate::termwindow::{DimensionContext, TermWindow, UIItemType};
+use crate::termwindow::{DimensionContext, TermWindow, TermWindowNotif, UIItemType};
 use crate::utilsprites::RenderMetrics;
-use config::keyassignment::KeyAssignment;
+use config::keyassignment::{ClipboardPasteSource, KeyAssignment};
 use config::Dimension;
 use mux::pane::CachePolicy;
 use mux::Mux;
 use std::cell::{Ref, RefCell};
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
 use window::color::LinearRgba;
+use window::{Clipboard, WindowOps};
+
+/// A pasted block as a one-line query: whitespace runs become single spaces.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// One tab as the search sees it.
 #[derive(Debug, Clone, PartialEq)]
@@ -387,12 +393,32 @@ impl TabSearch {
 }
 
 impl Modal for TabSearch {
-    fn perform_assignment(
-        &self,
-        _assignment: &KeyAssignment,
-        _term_window: &mut TermWindow,
-    ) -> bool {
-        false
+    /// Paste goes into the query, not through to the terminal underneath.
+    fn perform_assignment(&self, assignment: &KeyAssignment, term_window: &mut TermWindow) -> bool {
+        let KeyAssignment::PasteFrom(source) = assignment else {
+            return false;
+        };
+        let clipboard = match source {
+            ClipboardPasteSource::Clipboard => Clipboard::Clipboard,
+            ClipboardPasteSource::PrimarySelection => Clipboard::PrimarySelection,
+        };
+        let Some(window) = term_window.window.clone() else {
+            return true;
+        };
+        let future = window.get_clipboard(clipboard);
+        promise::spawn::spawn(async move {
+            let Ok(text) = future.await else { return };
+            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                let modal = tw.get_modal();
+                if let Some(search) = modal.as_ref().and_then(|m| m.downcast_ref::<TabSearch>()) {
+                    search.query.borrow_mut().push_str(&one_line(&text));
+                    search.updated_input();
+                    tw.invalidate_modal();
+                }
+            })));
+        })
+        .detach();
+        true
     }
 
     fn mouse_event(&self, _event: MouseEvent, _term_window: &mut TermWindow) -> anyhow::Result<()> {
@@ -491,6 +517,14 @@ impl Modal for TabSearch {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The query is one line: a pasted block collapses to its words.
+    #[test]
+    fn pasted_text_becomes_one_line() {
+        assert_eq!(one_line("foo\nbar\r\n  baz "), "foo bar baz");
+        assert_eq!(one_line("\n\n"), "");
+        assert_eq!(one_line("tab\tsep"), "tab sep");
+    }
 
     fn choice(tab_idx: usize, label: &str, detail: &str) -> TabChoice {
         TabChoice {

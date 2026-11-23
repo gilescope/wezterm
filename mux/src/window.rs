@@ -393,6 +393,26 @@ impl Window {
         (hist, pos)
     }
 
+    /// The walk with the active tab in it, and the position of that entry.
+    pub fn tab_history(&self) -> (Vec<TabId>, usize) {
+        self.synced_history()
+    }
+
+    /// Put back a walk saved by `tab_history`, `pos` indexing `ids`. Ids no
+    /// longer in the window are dropped; `pos` follows its entry. The active
+    /// tab should be the entry at `pos`, else it is appended on first use.
+    pub fn restore_tab_history(&mut self, ids: Vec<TabId>, pos: usize) {
+        let live = |id: &TabId| self.get_tab_idx_for_id(*id).is_some();
+        let kept_before = ids.iter().take(pos).filter(|id| live(id)).count();
+        let mut hist: Vec<TabId> = ids.into_iter().filter(|id| live(id)).collect();
+        let over = hist.len().saturating_sub(Self::HISTORY_CAP);
+        hist.drain(..over);
+        self.history_pos = kept_before
+            .saturating_sub(over)
+            .min(hist.len().saturating_sub(1));
+        self.tab_history = hist;
+    }
+
     fn sync_history_to_active(&mut self) {
         let (hist, pos) = self.synced_history();
         self.tab_history = hist;
@@ -665,6 +685,25 @@ mod history_test {
             w.push_tab(&Arc::new(Tab::new(&TerminalSize::default())));
         }
         w
+    }
+
+    /// A restart rebuilds the window with fresh tab ids; the saved walk is
+    /// put back so back/forward work at once, with the active tab as the
+    /// current entry. Ids that no longer exist are dropped.
+    #[test]
+    fn restored_history_steps_back_and_forward_at_once() {
+        let mut w = window_with(4);
+        let id = |w: &Window, i: usize| w.get_tab_at_idx(i).unwrap().tab_id();
+        let ids: Vec<TabId> = (0..4).map(|i| id(&w, i)).collect();
+        // Walk was 2, 0, 3, 1 and the user was at 3 (pos 2) when it shut down.
+        w.set_active_tab_idx_without_saving(3);
+        let saved = vec![ids[2], 999_999, ids[0], ids[3], ids[1]];
+        w.restore_tab_history(saved, 3);
+        assert_eq!(w.tab_history(), (vec![ids[2], ids[0], ids[3], ids[1]], 2));
+        assert_eq!(w.history_step(-1), Some(0));
+        assert_eq!(w.history_step(-1), Some(2));
+        assert_eq!(w.history_step(-1), None);
+        assert_eq!(w.history_step(3), Some(1));
     }
 
     /// Wheeling through tabs must not fill the history: a tab counts only

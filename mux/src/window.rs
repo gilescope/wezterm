@@ -1,6 +1,7 @@
 use crate::pane::CloseReason;
 use crate::{Mux, MuxNotification, Tab, TabId};
 use config::GuiPosition;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +23,9 @@ pub struct Window {
     history_pos: usize,
     active_since: Instant,
     history_dwell: Duration,
+    /// When each tab was last switched away from, so the GUI can tell a
+    /// quick hop from a return after an absence. A tab never left is absent.
+    left_at: BTreeMap<TabId, Instant>,
     workspace: String,
     title: String,
     initial_position: Option<GuiPosition>,
@@ -39,6 +43,7 @@ impl Window {
             history_pos: 0,
             active_since: Instant::now(),
             history_dwell: Duration::from_secs(1),
+            left_at: BTreeMap::new(),
             title: String::new(),
             workspace: workspace.unwrap_or_else(|| Mux::get().active_workspace()),
             initial_position,
@@ -124,6 +129,15 @@ impl Window {
             .map(|n| root_idx + 1 + n)
             .unwrap_or(self.tabs.len());
         root_idx + 1..end
+    }
+
+    /// Ids of the children of `tab_id`; empty for a child or an unknown tab.
+    pub fn child_tab_ids(&self, tab_id: TabId) -> Vec<TabId> {
+        let Some(idx) = self.get_tab_idx_for_id(tab_id) else {
+            return vec![];
+        };
+        let children = self.children_of(idx);
+        self.tabs[children].iter().map(|t| t.tab_id()).collect()
     }
 
     /// Indices of the root tabs, in order.
@@ -393,6 +407,26 @@ impl Window {
         (hist, pos)
     }
 
+    /// The walk with the active tab in it, and the position of that entry.
+    pub fn tab_history(&self) -> (Vec<TabId>, usize) {
+        self.synced_history()
+    }
+
+    /// Put back a walk saved by `tab_history`, `pos` indexing `ids`. Ids no
+    /// longer in the window are dropped; `pos` follows its entry. The active
+    /// tab should be the entry at `pos`, else it is appended on first use.
+    pub fn restore_tab_history(&mut self, ids: Vec<TabId>, pos: usize) {
+        let live = |id: &TabId| self.get_tab_idx_for_id(*id).is_some();
+        let kept_before = ids.iter().take(pos).filter(|id| live(id)).count();
+        let mut hist: Vec<TabId> = ids.into_iter().filter(|id| live(id)).collect();
+        let over = hist.len().saturating_sub(Self::HISTORY_CAP);
+        hist.drain(..over);
+        self.history_pos = kept_before
+            .saturating_sub(over)
+            .min(hist.len().saturating_sub(1));
+        self.tab_history = hist;
+    }
+
     fn sync_history_to_active(&mut self) {
         let (hist, pos) = self.synced_history();
         self.tab_history = hist;
@@ -440,6 +474,7 @@ impl Window {
         assert!(idx < self.tabs.len());
         if self.active_tab_idx != idx {
             if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                self.left_at.insert(tab.tab_id(), Instant::now());
                 if let Some(pane) = tab.get_active_pane() {
                     pane.focus_changed(false);
                 }
@@ -447,6 +482,14 @@ impl Window {
         }
         self.active_tab_idx = idx;
         self.invalidate();
+    }
+
+    /// How long ago the tab was switched away from; `None` for one never left.
+    pub fn time_away(&self, tab_id: TabId) -> Option<Duration> {
+        if self.tabs.get(self.active_tab_idx).map(|t| t.tab_id()) == Some(tab_id) {
+            return None;
+        }
+        self.left_at.get(&tab_id).map(Instant::elapsed)
     }
 
     /// Iterate over tabs in this window.
@@ -567,6 +610,23 @@ mod test {
         assert_eq!(w.root_indices(), vec![0, 1]);
     }
 
+    /// Closing a root takes its children with it, so they need listing.
+    #[test]
+    fn child_tab_ids_lists_a_roots_children_only() {
+        let (mut w, t) = window_with(2);
+        let (c1, c2) = (tab(), tab());
+        w.push_tab(&c1);
+        w.push_tab(&c2);
+        w.attach_tab_to_parent(c1.tab_id(), t[0].tab_id());
+        w.attach_tab_to_parent(c2.tab_id(), t[0].tab_id());
+        assert_eq!(
+            w.child_tab_ids(t[0].tab_id()),
+            vec![c1.tab_id(), c2.tab_id()]
+        );
+        assert!(w.child_tab_ids(t[1].tab_id()).is_empty());
+        assert!(w.child_tab_ids(c1.tab_id()).is_empty());
+    }
+
     /// A root moves with its children; a child moves only within its block.
     #[test]
     fn move_tab_relative_respects_blocks() {
@@ -667,6 +727,25 @@ mod history_test {
         w
     }
 
+    /// A restart rebuilds the window with fresh tab ids; the saved walk is
+    /// put back so back/forward work at once, with the active tab as the
+    /// current entry. Ids that no longer exist are dropped.
+    #[test]
+    fn restored_history_steps_back_and_forward_at_once() {
+        let mut w = window_with(4);
+        let id = |w: &Window, i: usize| w.get_tab_at_idx(i).unwrap().tab_id();
+        let ids: Vec<TabId> = (0..4).map(|i| id(&w, i)).collect();
+        // Walk was 2, 0, 3, 1 and the user was at 3 (pos 2) when it shut down.
+        w.set_active_tab_idx_without_saving(3);
+        let saved = vec![ids[2], 999_999, ids[0], ids[3], ids[1]];
+        w.restore_tab_history(saved, 3);
+        assert_eq!(w.tab_history(), (vec![ids[2], ids[0], ids[3], ids[1]], 2));
+        assert_eq!(w.history_step(-1), Some(0));
+        assert_eq!(w.history_step(-1), Some(2));
+        assert_eq!(w.history_step(-1), None);
+        assert_eq!(w.history_step(3), Some(1));
+    }
+
     /// Wheeling through tabs must not fill the history: a tab counts only
     /// once it has been looked at for the dwell time.
     #[test]
@@ -686,6 +765,24 @@ mod history_test {
         assert_eq!(w.history_step(1), Some(3));
         assert_eq!(w.history_step(1), Some(0));
         assert_eq!(w.history_step(1), None);
+    }
+
+    /// A tab never left has no away time; one you came back to reports
+    /// how long it waited, so the GUI can skip a cue after a quick hop.
+    #[test]
+    fn time_away_counts_from_when_the_tab_was_left() {
+        let mut w = window_with(2);
+        let ids: Vec<TabId> = w.iter_tabs().map(|t| t.tab_id()).collect();
+        let (t0, t1) = (ids[0], ids[1]);
+        assert_eq!(w.time_away(t0), None);
+        assert_eq!(w.time_away(t1), None);
+        w.remember_and_set_active_tab_idx(1);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(w.time_away(t0) >= Some(Duration::from_millis(20)));
+        assert_eq!(w.time_away(t1), None);
+        w.remember_and_set_active_tab_idx(0);
+        assert!(w.time_away(t1).is_some());
+        assert_eq!(w.time_away(99_999), None);
     }
 
     /// Back walks to earlier tabs, forward returns, and a fresh activation

@@ -901,7 +901,19 @@ impl Mux {
         self.prune_dead_windows();
     }
 
+    /// Closes the tab and, if it is a root, its child tabs too: children
+    /// are only meaningful under their root, and their processes would
+    /// otherwise be left running with nothing on screen to reach them.
     pub fn remove_tab(&self, tab_id: TabId) -> Option<Arc<Tab>> {
+        let children: Vec<TabId> = self
+            .windows
+            .read()
+            .values()
+            .flat_map(|w| w.child_tab_ids(tab_id))
+            .collect();
+        for child in children {
+            self.remove_tab_internal(child);
+        }
         let tab = self.remove_tab_internal(tab_id);
         self.prune_dead_windows();
         tab

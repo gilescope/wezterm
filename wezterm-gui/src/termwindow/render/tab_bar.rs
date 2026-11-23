@@ -230,6 +230,16 @@ impl crate::TermWindow {
         }
     }
 
+    /// Pixels from the window's client origin to the panes: (left bar, top bar).
+    pub fn content_offsets(&self) -> (f32, f32) {
+        let left = if self.show_tab_bar {
+            self.tab_bar_pixel_width()
+        } else {
+            0.
+        };
+        (left, self.horizontal_bar_heights().0)
+    }
+
     pub fn tab_bar_pixel_width(&self) -> f32 {
         // A drag-resized width takes precedence, but only while the bar is vertical.
         if let Some(width) = self.tab_bar_width_override {

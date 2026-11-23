@@ -522,6 +522,11 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub show_tab_history_buttons_in_tab_bar: bool,
 
+    /// A tab-styled "Browser" button beside the search box. It emits the
+    /// `browser-toggle` event; it is lit while the active tab is titled `Browser`.
+    #[dynamic(default)]
+    pub show_browser_button_in_tab_bar: bool,
+
     #[dynamic(default = "default_true")]
     pub show_close_tab_button_in_tabs: bool,
 

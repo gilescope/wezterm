@@ -128,14 +128,30 @@ impl UserData for GuiWin {
                 pixel_height: usize,
                 dpi: usize,
                 is_full_screen: bool,
+                content_left: usize,
+                content_top: usize,
             }
             impl_lua_conversion_dynamic!(Dims);
+
+            let (tx, rx) = smol::channel::bounded(1);
+            this.window
+                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    let (left, top) = term_window.content_offsets();
+                    tx.try_send((left, top)).ok();
+                })));
+            let (left, top) = rx
+                .recv()
+                .await
+                .map_err(|e| anyhow::anyhow!("{:#}", e))
+                .map_err(luaerr)?;
 
             let dims = Dims {
                 pixel_width: dims.pixel_width,
                 pixel_height: dims.pixel_height,
                 dpi: dims.dpi,
                 is_full_screen: window_state.contains(WindowState::FULL_SCREEN),
+                content_left: left.max(0.).round() as usize,
+                content_top: top.max(0.).round() as usize,
                 // FIXME: expose other states here
             };
             Ok(dims)
@@ -206,6 +222,32 @@ impl UserData for GuiWin {
             this.window
                 .notify(TermWindowNotif::SetConfigOverrides(value));
             Ok(())
+        });
+        methods.add_async_method("get_position", |_, this, _: ()| async move {
+            let (tx, rx) = smol::channel::bounded(1);
+            this.window
+                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    tx.try_send(term_window.window.as_ref().map(|w| w.get_window_position()))
+                        .ok();
+                })));
+            let pending = rx
+                .recv()
+                .await
+                .map_err(|e| anyhow::anyhow!("{:#}", e))
+                .map_err(luaerr)?;
+            let Some(pending) = pending else {
+                return Ok(None);
+            };
+            let pos = pending.await.map_err(luaerr)?;
+
+            #[derive(FromDynamic, ToDynamic)]
+            struct Position {
+                x: isize,
+                y: isize,
+            }
+            impl_lua_conversion_dynamic!(Position);
+
+            Ok(pos.map(|p| Position { x: p.x, y: p.y }))
         });
         methods.add_async_method("is_focused", |_, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);

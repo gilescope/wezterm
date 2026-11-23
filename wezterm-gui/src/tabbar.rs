@@ -27,6 +27,16 @@ pub struct TabBarState {
     titles: Vec<(usize, TitleText)>,
 }
 
+/// Title of the tab a script uses to host a browser; the Browser button lights up on it.
+pub const BROWSER_TAB_TITLE: &str = "Browser";
+
+/// The Browser button is lit while the active tab is the browser's tab.
+fn browser_selected(tab_info: &[TabInformation]) -> bool {
+    tab_info
+        .iter()
+        .any(|t| t.is_active && t.tab_title == BROWSER_TAB_TITLE)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabBarItem {
     None,
@@ -39,6 +49,11 @@ pub enum TabBarItem {
     NewTabButton,
     /// Opens the tab search dropdown; drawn at the right of a horizontal bar.
     TabSearch,
+    /// Emits `browser-toggle`; `selected` while the active tab is titled
+    /// [`BROWSER_TAB_TITLE`].
+    Browser {
+        selected: bool,
+    },
     /// Browser-style back/forward through the tabs the window has shown;
     /// `enabled` is false when that direction has nowhere to go.
     History {
@@ -681,7 +696,7 @@ impl TabBarState {
         let tab_width_max = if effective_use_fancy_tab_bar(config) || available_cells >= titles_len
         {
             // We can render each title with its full width
-            usize::max_value()
+            usize::MAX
         } else {
             // We need to clamp the length to balance them out
             available_cells / number_of_tabs
@@ -763,7 +778,7 @@ impl TabBarState {
                 let req = TitleRequest {
                     tab_idx,
                     hover,
-                    max_width: tab_title_len,
+                    max_width: tab_width_max,
                 };
                 recomputed = compute_tab_titles(tab_info, pane_info, config, &[req]).remove(0);
                 &recomputed
@@ -832,6 +847,20 @@ impl TabBarState {
                 width,
             });
 
+            x += width;
+        }
+
+        if config.show_browser_button_in_tab_bar {
+            let selected = browser_selected(tab_info);
+            let button = parse_status_text(" Browser ", black_cell.attrs().clone());
+            let width = button.len();
+            line.append_line(button.clone(), SEQ_ZERO);
+            items.push(TabEntry {
+                item: TabBarItem::Browser { selected },
+                title: button,
+                x,
+                width,
+            });
             x += width;
         }
 
@@ -1219,6 +1248,17 @@ mod tests {
             HistoryNav::default(),
             reuse,
         )
+    }
+
+    #[test]
+    fn browser_button_lights_only_on_the_active_browser_tab() {
+        let (mut tab_info, _) = tabs(3);
+        assert!(!browser_selected(&tab_info));
+        tab_info[1].tab_title = BROWSER_TAB_TITLE.into();
+        assert!(!browser_selected(&tab_info), "inactive Browser tab");
+        tab_info[0].is_active = false;
+        tab_info[1].is_active = true;
+        assert!(browser_selected(&tab_info));
     }
 
     /// A spinner frame (10 Hz while an agent works) only re-asks Lua for

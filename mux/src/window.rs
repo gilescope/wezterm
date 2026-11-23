@@ -131,6 +131,15 @@ impl Window {
         root_idx + 1..end
     }
 
+    /// Ids of the children of `tab_id`; empty for a child or an unknown tab.
+    pub fn child_tab_ids(&self, tab_id: TabId) -> Vec<TabId> {
+        let Some(idx) = self.get_tab_idx_for_id(tab_id) else {
+            return vec![];
+        };
+        let children = self.children_of(idx);
+        self.tabs[children].iter().map(|t| t.tab_id()).collect()
+    }
+
     /// Indices of the root tabs, in order.
     pub fn root_indices(&self) -> Vec<usize> {
         (0..self.tabs.len())
@@ -579,6 +588,23 @@ mod test {
         assert_eq!(ids(&w), vec![c.tab_id(), t[1].tab_id()]);
         assert_eq!(c.get_parent(), None);
         assert_eq!(w.root_indices(), vec![0, 1]);
+    }
+
+    /// Closing a root takes its children with it, so they need listing.
+    #[test]
+    fn child_tab_ids_lists_a_roots_children_only() {
+        let (mut w, t) = window_with(2);
+        let (c1, c2) = (tab(), tab());
+        w.push_tab(&c1);
+        w.push_tab(&c2);
+        w.attach_tab_to_parent(c1.tab_id(), t[0].tab_id());
+        w.attach_tab_to_parent(c2.tab_id(), t[0].tab_id());
+        assert_eq!(
+            w.child_tab_ids(t[0].tab_id()),
+            vec![c1.tab_id(), c2.tab_id()]
+        );
+        assert!(w.child_tab_ids(t[1].tab_id()).is_empty());
+        assert!(w.child_tab_ids(c1.tab_id()).is_empty());
     }
 
     /// A root moves with its children; a child moves only within its block.

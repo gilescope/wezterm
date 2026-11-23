@@ -164,9 +164,10 @@ impl crate::TermWindow {
         for item in items {
             match item.item {
                 TabBarItem::LeftStatus => left_status.push(item_to_elem(item)),
-                TabBarItem::None | TabBarItem::RightStatus | TabBarItem::TabSearch => {
-                    right_eles.push(item_to_elem(item))
-                }
+                TabBarItem::None
+                | TabBarItem::RightStatus
+                | TabBarItem::Browser { .. }
+                | TabBarItem::TabSearch => right_eles.push(item_to_elem(item)),
                 TabBarItem::WindowButton(_) => {
                     if self.config.integrated_title_button_alignment
                         == IntegratedTitleButtonAlignment::Left
@@ -343,6 +344,7 @@ impl crate::TermWindow {
                 }
                 TabBarItem::WindowButton(_)
                 | TabBarItem::TabSearch
+                | TabBarItem::Browser { .. }
                 | TabBarItem::History { .. } => {
                     // Window buttons, the search box and the history
                     // buttons live on the horizontal bar.
@@ -639,6 +641,46 @@ impl crate::TermWindow {
                         text: new_tab.fg_color.to_linear().mul_alpha(alpha).into(),
                     })
                     .hover_colors(enabled.then(|| ElementColors {
+                        border: BorderColor::new(new_tab_hover.fg_color.to_linear()),
+                        bg: new_tab_hover.bg_color.to_linear().into(),
+                        text: new_tab_hover.fg_color.to_linear().into(),
+                    }))
+            }
+            TabBarItem::Browser { selected } => {
+                // Looks like a tab: lit like the active tab while the browser is shown.
+                let (bg, fg) = if selected {
+                    (
+                        active_tab.bg_color.to_linear(),
+                        active_tab.fg_color.to_linear(),
+                    )
+                } else {
+                    (
+                        new_tab.bg_color.to_linear(),
+                        new_tab.fg_color.to_linear().mul_alpha(0.7),
+                    )
+                };
+                Element::new(font, ElementContent::Text("Browser".to_string()))
+                    .vertical_align(VerticalAlign::Middle)
+                    .item_type(UIItemType::TabBar(item.item.clone()))
+                    .margin(BoxDimension {
+                        left: Dimension::Cells(0.5),
+                        right: Dimension::Cells(0.),
+                        top: Dimension::Cells(0.2),
+                        bottom: Dimension::Cells(0.),
+                    })
+                    .padding(BoxDimension {
+                        left: Dimension::Cells(0.75),
+                        right: Dimension::Cells(0.75),
+                        top: Dimension::Cells(0.),
+                        bottom: Dimension::Cells(0.),
+                    })
+                    .border(BoxDimension::new(Dimension::Pixels(1.)))
+                    .colors(ElementColors {
+                        border: BorderColor::new(fg.mul_alpha(0.5)),
+                        bg: bg.into(),
+                        text: fg.into(),
+                    })
+                    .hover_colors(Some(ElementColors {
                         border: BorderColor::new(new_tab_hover.fg_color.to_linear()),
                         bg: new_tab_hover.bg_color.to_linear().into(),
                         text: new_tab_hover.fg_color.to_linear().into(),

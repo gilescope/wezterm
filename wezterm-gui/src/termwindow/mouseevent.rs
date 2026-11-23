@@ -645,6 +645,12 @@ impl super::TermWindow {
                     self.dragging = Some((item, event));
                 }
                 TabBarItem::TabSearch => self.show_tab_search(),
+                TabBarItem::Browser { .. } => {
+                    if let Some(pane) = self.get_active_pane_or_overlay() {
+                        let event = KeyAssignment::EmitEvent("browser-toggle".to_string());
+                        self.perform_key_assignment(&pane, &event).ok();
+                    }
+                }
                 TabBarItem::History { back, enabled } => {
                     if enabled {
                         self.activate_tab_history(if back { -1 } else { 1 }).ok();
@@ -713,6 +719,7 @@ impl super::TermWindow {
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
                 | TabBarItem::TabSearch
+                | TabBarItem::Browser { .. }
                 | TabBarItem::History { .. }
                 | TabBarItem::WindowButton(_) => {}
             },
@@ -729,6 +736,7 @@ impl super::TermWindow {
                 TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
                 | TabBarItem::TabSearch
+                | TabBarItem::Browser { .. }
                 | TabBarItem::History { .. }
                 | TabBarItem::WindowButton(_) => {}
             },
@@ -749,6 +757,7 @@ impl super::TermWindow {
                 TabBarItem::WindowButton(_)
                 | TabBarItem::Tab { .. }
                 | TabBarItem::TabSearch
+                | TabBarItem::Browser { .. }
                 | TabBarItem::History { .. }
                 | TabBarItem::NewTabButton { .. } => {}
             },

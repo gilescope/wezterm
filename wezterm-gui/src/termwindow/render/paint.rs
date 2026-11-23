@@ -272,6 +272,18 @@ impl crate::TermWindow {
             }
         }
 
+        // Resume card, same placement rules as the rain.
+        if let Some(card_pane) = self.resume_card_pane_id() {
+            if let Some(pos) = panes
+                .iter()
+                .find(|p| p.is_active && p.pane.pane_id() == card_pane)
+            {
+                let (left, top, width, height) = (pos.left, pos.top, pos.width, pos.height);
+                self.paint_resume_card(&mut layers, left, top, width, height)
+                    .context("paint_resume_card")?;
+            }
+        }
+
         if let Some(pane) = self.get_active_pane_or_overlay() {
             let splits = self.get_splits();
             for split in &splits {

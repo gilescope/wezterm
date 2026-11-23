@@ -696,7 +696,7 @@ impl TabBarState {
         let tab_width_max = if effective_use_fancy_tab_bar(config) || available_cells >= titles_len
         {
             // We can render each title with its full width
-            usize::max_value()
+            usize::MAX
         } else {
             // We need to clamp the length to balance them out
             available_cells / number_of_tabs
@@ -778,7 +778,7 @@ impl TabBarState {
                 let req = TitleRequest {
                     tab_idx,
                     hover,
-                    max_width: tab_title_len,
+                    max_width: tab_width_max,
                 };
                 recomputed = compute_tab_titles(tab_info, pane_info, config, &[req]).remove(0);
                 &recomputed

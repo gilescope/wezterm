@@ -1137,6 +1137,7 @@ impl WindowInner {
                     current_app.setPresentationOptions_(
                         NSApplicationPresentationOptions::NSApplicationPresentationDefault,
                     );
+                    self.update_titlebar_background();
                 },
                 None => unsafe {
                     // Go full screen
@@ -2742,7 +2743,6 @@ impl WindowView {
                 let mut inner = myself.inner.borrow_mut();
                 inner.key_is_down.replace(key_is_down);
                 inner.ime_state = ImeDisposition::None;
-                inner.ime_text.clear();
             }
 
             unsafe {

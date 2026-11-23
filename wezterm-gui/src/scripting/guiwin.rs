@@ -200,6 +200,32 @@ impl UserData for GuiWin {
                 .notify(TermWindowNotif::SetConfigOverrides(value));
             Ok(())
         });
+        methods.add_async_method("get_position", |_, this, _: ()| async move {
+            let (tx, rx) = smol::channel::bounded(1);
+            this.window
+                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    tx.try_send(term_window.window.as_ref().map(|w| w.get_window_position()))
+                        .ok();
+                })));
+            let pending = rx
+                .recv()
+                .await
+                .map_err(|e| anyhow::anyhow!("{:#}", e))
+                .map_err(luaerr)?;
+            let Some(pending) = pending else {
+                return Ok(None);
+            };
+            let pos = pending.await.map_err(luaerr)?;
+
+            #[derive(FromDynamic, ToDynamic)]
+            struct Position {
+                x: isize,
+                y: isize,
+            }
+            impl_lua_conversion_dynamic!(Position);
+
+            Ok(pos.map(|p| Position { x: p.x, y: p.y }))
+        });
         methods.add_async_method("is_focused", |_, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);
             this.window

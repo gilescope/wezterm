@@ -446,6 +446,21 @@ fn set_window_position(window: *mut Object, coords: ScreenPoint) {
     }
 }
 
+/// The inverse of `set_window_position`: the top left pixel of the client area.
+fn get_window_position(window: *mut Object) -> ScreenPoint {
+    // SAFETY: `window` is the live NSWindow owned by `Window`/`WindowInner`;
+    // this runs on the main thread (via `Connection::with_window_inner`),
+    // as `set_window_position` does. The calls only read the frame.
+    let top_left = unsafe {
+        let content_frame = NSWindow::contentRectForFrameRect_(window, NSWindow::frame(window));
+        NSPoint::new(
+            content_frame.origin.x,
+            content_frame.origin.y + content_frame.size.height,
+        )
+    };
+    cartesian_to_screen_point(top_left)
+}
+
 impl Window {
     pub async fn new_window<F>(
         _class_name: &str,
@@ -828,6 +843,12 @@ impl WindowOps for Window {
             inner.set_window_position(coords);
             Ok(())
         });
+    }
+
+    fn get_window_position(&self) -> Future<Option<ScreenPoint>> {
+        Connection::with_window_inner(self.id, move |inner| {
+            Ok(Some(get_window_position(*inner.window)))
+        })
     }
 
     fn set_text_cursor_position(&self, cursor: Rect) {

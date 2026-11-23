@@ -93,6 +93,26 @@ impl UserData for MuxWindow {
             }
             Ok(result)
         });
+        methods.add_method("tab_history", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let window = this.resolve(&mux)?;
+            let (ids, pos) = window.tab_history();
+            let tabs: Vec<MuxTab> = ids.into_iter().map(MuxTab).collect();
+            Ok((tabs, pos + 1))
+        });
+        methods.add_method(
+            "set_tab_history",
+            |_, this, (tabs, pos): (Vec<mlua::AnyUserData>, usize)| {
+                let mux = get_mux()?;
+                let mut window = this.resolve_mut(&mux)?;
+                let ids = tabs
+                    .iter()
+                    .map(|t| t.borrow::<MuxTab>().map(|t| t.0))
+                    .collect::<mlua::Result<Vec<_>>>()?;
+                window.restore_tab_history(ids, pos.saturating_sub(1));
+                Ok(())
+            },
+        );
         methods.add_method("active_tab", |_, this, _: ()| {
             let mux = get_mux()?;
             let window = this.resolve(&mux)?;

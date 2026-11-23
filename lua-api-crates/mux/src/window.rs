@@ -93,6 +93,13 @@ impl UserData for MuxWindow {
             }
             Ok(result)
         });
+        methods.add_method("tab_history", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let window = this.resolve(&mux)?;
+            let (ids, pos) = window.tab_history();
+            let tabs: Vec<MuxTab> = ids.into_iter().map(MuxTab).collect();
+            Ok((tabs, pos + 1))
+        });
         methods.add_method(
             "set_tab_history",
             |_, this, (tabs, pos): (Vec<mlua::AnyUserData>, usize)| {

@@ -852,6 +852,11 @@ pub struct Config {
     #[dynamic(default)]
     pub swallow_mouse_click_on_pane_focus: bool,
 
+    /// Plain-click a highlighted hyperlink even when the program in the pane
+    /// has grabbed the mouse, instead of needing `bypass_mouse_reporting_modifiers`.
+    #[dynamic(default)]
+    pub click_hyperlinks_when_mouse_grabbed: bool,
+
     #[dynamic(default = "default_swallow_mouse_click_on_window_focus")]
     pub swallow_mouse_click_on_window_focus: bool,
 

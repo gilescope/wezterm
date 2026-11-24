@@ -3584,6 +3584,11 @@ impl TermWindow {
         // perform below; here we allow the user to define an `open-uri` event
         // handler that can bypass the normal `open_url` functionality.
         if let Some(link) = self.current_highlight.as_ref().cloned() {
+            // Acknowledge the click now: the handler may take a while. The
+            // next mouse move restores the pointer.
+            if let Some(w) = self.window.as_ref() {
+                w.set_cursor(Some(CursorIcon::Progress));
+            }
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());
 

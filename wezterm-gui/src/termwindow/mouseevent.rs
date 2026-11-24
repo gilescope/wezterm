@@ -1145,6 +1145,14 @@ impl super::TermWindow {
                     }
                 }
 
+                // A hovered link is the user's target, not the program's.
+                if mouse_reporting
+                    && self.config.click_hyperlinks_when_mouse_grabbed
+                    && self.current_highlight.is_some()
+                {
+                    mouse_reporting = false;
+                }
+
                 if mouse_reporting {
                     // If they were scrolled back prior to launching an
                     // application that captures the mouse, then mouse based

@@ -36,22 +36,32 @@ pub struct TabChoice {
     pub is_child: bool,
     /// What the tab bar shows for it, falling back to the pane title.
     pub label: String,
-    /// Directory and program, shown dimmer after the label.
+    /// Directory and program, shown dimmer after the label (a page's URL on a page row).
     pub detail: String,
+    /// `Some(i)`: this row is the tab's i-th search item (a page in the browser
+    /// window the tab stands for), not the tab itself. `tab_idx` is still the tab.
+    pub item: Option<usize>,
 }
 
 impl TabChoice {
     /// Everything the matcher may hit: label, detail and the 1-based index
     /// the bar numbers tabs with.
     fn haystack(&self) -> String {
-        format!("{} {} {}", self.tab_idx + 1, self.label, self.detail)
+        // A page has no bar number of its own: its tab's would make "2" hit every page of tab 2.
+        match self.item {
+            Some(_) => format!("{} {}", self.label, self.detail),
+            None => format!("{} {} {}", self.tab_idx + 1, self.label, self.detail),
+        }
     }
 }
 
 /// Indices into `choices` ordered best match first; empty query keeps bar order.
 pub fn compute_matches(query: &str, choices: &[TabChoice]) -> Vec<usize> {
     if query.is_empty() {
-        return (0..choices.len()).collect();
+        // Pages are found by searching, not listed: 47 tabs of them would bury the bar.
+        return (0..choices.len())
+            .filter(|&i| choices[i].item.is_none())
+            .collect();
     }
     let pattern = matcher_pattern(query);
     let mut scored: Vec<(u32, usize)> = choices
@@ -121,7 +131,7 @@ impl TabSearch {
         window
             .iter_tabs()
             .enumerate()
-            .map(|(tab_idx, tab)| {
+            .flat_map(|(tab_idx, tab)| {
                 let pane = tab.get_active_pane();
                 let pane_title = pane.as_ref().map(|p| p.get_title()).unwrap_or_default();
                 let cwd = pane
@@ -140,12 +150,29 @@ impl TabSearch {
                 } else {
                     bar_title(tab_idx).unwrap_or(pane_title)
                 };
-                TabChoice {
+                let pages = tab
+                    .get_search_items()
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(i, page)| TabChoice {
+                        tab_idx,
+                        is_child: true,
+                        label: if page.title.is_empty() {
+                            page.url.clone()
+                        } else {
+                            page.title
+                        },
+                        detail: page.url,
+                        item: Some(i),
+                    });
+                std::iter::once(TabChoice {
                     tab_idx,
                     is_child: tab.get_parent().is_some(),
                     label,
                     detail: format!("{cwd} {proc}").trim().to_string(),
-                }
+                    item: None,
+                })
+                .chain(pages)
             })
             .collect()
     }
@@ -213,15 +240,12 @@ impl TabSearch {
                 (LinearRgba::TRANSPARENT.into(), fg.clone(), dim.clone())
             };
             let indent = if choice.is_child { "  " } else { "" };
+            let head = match choice.item {
+                Some(_) => format!("{indent}   ↳ {}", choice.label),
+                None => format!("{indent}{:>2} {}", choice.tab_idx + 1, choice.label),
+            };
             let row = vec![
-                Element::new(
-                    &font,
-                    ElementContent::Text(format!(
-                        "{indent}{:>2} {}",
-                        choice.tab_idx + 1,
-                        choice.label
-                    )),
-                ),
+                Element::new(&font, ElementContent::Text(head)),
                 Element::new(&font, ElementContent::Text(format!("  {}", choice.detail))).colors(
                     ElementColors {
                         border: BorderColor::default(),
@@ -362,20 +386,24 @@ impl TabSearch {
     }
 
     /// The tab the highlighted row stands for, if any.
-    fn selected_tab_idx(&self) -> Option<usize> {
+    fn selected_choice(&self) -> Option<&TabChoice> {
         let selected = *self.selected_row.borrow();
         let matches = self.matches.borrow();
         let idx = *matches.as_ref()?.matches.get(selected)?;
-        Some(self.choices[idx].tab_idx)
+        self.choices.get(idx)
     }
 
     /// Close the dropdown and switch to the highlighted tab.
     fn activate_selected(&self, term_window: &mut TermWindow) {
-        let target = self.selected_tab_idx();
+        let target = self.selected_choice().map(|c| (c.tab_idx, c.item));
         term_window.cancel_modal();
-        if let Some(tab_idx) = target {
+        if let Some((tab_idx, item)) = target {
             if let Err(err) = term_window.activate_tab(tab_idx as isize) {
                 log::error!("tab search: activate tab {tab_idx}: {err:#}");
+                return;
+            }
+            if let Some(item) = item {
+                term_window.pick_search_item(item);
             }
         }
     }
@@ -532,6 +560,7 @@ mod test {
             is_child: false,
             label: label.into(),
             detail: detail.into(),
+            item: None,
         }
     }
 
@@ -572,6 +601,50 @@ mod test {
     #[test]
     fn fuzzy_query_ranks_the_closer_title_first() {
         assert_eq!(compute_matches("fss", &choices())[0], 2);
+    }
+
+    fn item_choice(tab_idx: usize, item: usize, title: &str, url: &str) -> TabChoice {
+        TabChoice {
+            tab_idx,
+            is_child: true,
+            label: title.into(),
+            detail: url.into(),
+            item: Some(item),
+        }
+    }
+
+    /// A Browser tab (index 1) carrying two pages, after its root and before the next tab.
+    fn with_pages() -> Vec<TabChoice> {
+        vec![
+            choice(0, "main", "/Users/g/git/wezterm zsh"),
+            choice(1, "Browser", ""),
+            item_choice(
+                1,
+                0,
+                "Pull request 2521",
+                "https://github.com/midnightntwrk/midnight-node/pull/2521",
+            ),
+            item_choice(1, 1, "Example Domain", "https://example.com/"),
+            choice(2, "other", "/tmp zsh"),
+        ]
+    }
+
+    #[test]
+    fn page_rows_stay_out_of_the_unfiltered_list() {
+        assert_eq!(compute_matches("", &with_pages()), vec![0, 1, 4]);
+    }
+
+    #[test]
+    fn a_page_title_or_url_finds_its_row() {
+        let c = with_pages();
+        assert_eq!(compute_matches("example domain", &c)[0], 3);
+        assert_eq!(compute_matches("pull/2521", &c)[0], 2);
+    }
+
+    #[test]
+    fn a_tab_number_does_not_hit_page_rows() {
+        // "2" is the bar number of tab 1; page rows have no number of their own.
+        assert!(!compute_matches("2", &with_pages()).contains(&3));
     }
 
     #[test]

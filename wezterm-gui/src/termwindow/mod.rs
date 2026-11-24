@@ -3575,6 +3575,16 @@ impl TermWindow {
         Ok(PerformAssignmentResult::Handled)
     }
 
+    /// Tell the active tab which of its search items tab search picked, and
+    /// let the `search-item-picked` handler act on it (e.g. select that page).
+    pub fn pick_search_item(&mut self, item: usize) {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        tab.set_search_pick(Some(item));
+        self.emit_window_event("search-item-picked", None);
+    }
+
     fn do_open_link_at_mouse_cursor(&self, pane: &Arc<dyn Pane>) {
         // They clicked on a link, so let's open it!
         // We need to ensure that we spawn the `open` call outside of the context

@@ -124,3 +124,163 @@ fn kitty_frame_edit_keeps_the_stored_hash_current() {
 
     assert_ne!(edited_hash, transmitted_hash);
 }
+
+/// A pty writer the test can read back: what the terminal answers to an escape.
+#[derive(Clone, Default)]
+struct Answers(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Answers {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a fresh terminal writes back after being fed `seq`.
+fn answer_to(seq: &str) -> String {
+    let answers = Answers::default();
+    let mut term = Terminal::new(
+        TerminalSize {
+            rows: 3,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 48,
+            dpi: 0,
+        },
+        Arc::new(TestTermConfig { scrollback: 0 }),
+        "WezTerm",
+        "O_o",
+        Box::new(answers.clone()),
+    );
+    // The terminal writes through a background thread, so a reply may land after
+    // `advance_bytes` returns. A device status report asked for last is answered
+    // after every earlier reply: wait for it, then strip it.
+    const STATUS_OK: &str = "\x1b[0n";
+    term.advance_bytes(seq.as_bytes());
+    term.advance_bytes(b"\x1b[5n");
+    for _ in 0..400 {
+        let text = String::from_utf8(answers.0.lock().unwrap().clone()).unwrap();
+        if let Some(before) = text.strip_suffix(STATUS_OK) {
+            return before.to_string();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("no status report reply: the terminal did not answer in 2s");
+}
+
+/// A 1x1 RGB pixel (3 bytes of data).
+const PIXEL: &str = "f=24,t=d,s=1,v=1;AAAA";
+
+/// Kitty replies `OK` to a transmit that names its image with `i=`, not only
+/// `I=`; programs probe graphics support by transmitting a pixel and waiting.
+#[test]
+fn kitty_transmit_with_an_image_id_is_acknowledged() {
+    let seq = format!("\x1b_Gi=4294111295,{PIXEL}\x1b\\");
+    std::assert_eq!(answer_to(&seq), "\x1b_Gi=4294111295;OK\x1b\\");
+}
+
+/// `q=1` asks for no `OK`.
+#[test]
+fn kitty_quiet_transmit_is_not_acknowledged() {
+    let seq = format!("\x1b_Gq=1,i=7,{PIXEL}\x1b\\");
+    std::assert_eq!(answer_to(&seq), "");
+}
+
+/// With neither `i=` nor `I=` there is nothing to name in a reply.
+#[test]
+fn kitty_transmit_without_an_id_is_not_acknowledged() {
+    let seq = format!("\x1b_G{PIXEL}\x1b\\");
+    std::assert_eq!(answer_to(&seq), "");
+}
+
+/// Standard base64 (RFC 4648, with padding) of `bytes`; the test crate has no base64 dependency.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                ABC[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// macOS rounds a shared-memory object up to whole pages, so a 4x4 RGBA frame
+/// (64 bytes) is read back as 16384. The terminal must use only the pixels the
+/// transmit describes (`s` x `v` x bytes per pixel), as Kitty does, not the padding.
+#[test]
+#[cfg(target_os = "macos")]
+fn kitty_shared_memory_frame_ignores_the_padding_macos_adds() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    const HELPER: &str = "import _posixshmem,os,mmap,sys\n\
+        n='/wzt_%d'%os.getpid()\n\
+        fd=_posixshmem.shm_open(n,os.O_CREAT|os.O_RDWR,0o600)\n\
+        os.ftruncate(fd,64)\n\
+        m=mmap.mmap(fd,64)\n\
+        m[:64]=bytes(range(64))\n\
+        print(n,flush=True)\n\
+        sys.stdin.read()\n";
+    let mut child = match Command::new("python3")
+        .args(["-I", "-c", HELPER])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("skipped: python3 is needed to create shared memory: {err}");
+            return;
+        }
+    };
+    let mut name = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut name)
+        .unwrap();
+    let seq = format!(
+        "\x1b_Gf=32,t=s,s=4,v=4,i=9;{}\x1b\\",
+        base64(name.trim().as_bytes())
+    );
+    std::assert_eq!(answer_to(&seq), "\x1b_Gi=9;OK\x1b\\");
+    drop(child.stdin.take());
+    child.wait().unwrap();
+}
+
+/// The content hash of the one image a terminal holds after being fed an RGBA
+/// transmit of `side` x `side` zero pixels.
+fn hash_after_transmitting(side: usize) -> [u8; 32] {
+    let mut term = TestTerm::new(3, 10, 0);
+    let pixels = vec![0u8; side * side * 4];
+    let seq = format!(
+        "\x1b_Ga=T,t=d,f=32,s={side},v={side},i=1;{}\x1b\\",
+        base64(&pixels)
+    );
+    term.advance_bytes(seq.as_bytes());
+    first_image(&term).data().compute_hash()
+}
+
+/// Hashing every frame costs more than it saves for programs that stream big
+/// frames (a browser in a pane): each one is new, so a content id never matches.
+/// Frames of 1 MiB or more therefore get a cheap unique id instead.
+#[test]
+fn kitty_streamed_frames_are_not_content_hashed() {
+    // 512 x 512 x 4 bytes = 1 MiB: identical pixels, yet distinct ids.
+    std::assert_ne!(hash_after_transmitting(512), hash_after_transmitting(512));
+}
+
+/// Small images keep the content hash, so the same picture shares one texture.
+#[test]
+fn kitty_small_images_are_still_content_hashed() {
+    std::assert_eq!(hash_after_transmitting(64), hash_after_transmitting(64));
+}

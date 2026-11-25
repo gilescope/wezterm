@@ -527,6 +527,10 @@ pub struct Config {
     #[dynamic(default)]
     pub show_browser_button_in_tab_bar: bool,
 
+    /// What the Browser button says; `+` suits a button that opens a new browser tab.
+    #[dynamic(default = "default_browser_button_label")]
+    pub browser_button_label: String,
+
     #[dynamic(default = "default_true")]
     pub show_close_tab_button_in_tabs: bool,
 
@@ -1836,6 +1840,10 @@ pub fn default_write_timeout() -> Duration {
 
 pub fn default_local_echo_threshold_ms() -> Option<u64> {
     Some(100)
+}
+
+fn default_browser_button_label() -> String {
+    "Browser".to_string()
 }
 
 fn default_bypass_mouse_reporting_modifiers() -> Modifiers {

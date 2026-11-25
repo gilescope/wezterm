@@ -762,12 +762,20 @@ impl TerminalState {
             }
         };
 
+        // Shared memory can be bigger than the image: macOS rounds it up to whole pages.
+        let from_shm_unsized = matches!(
+            transmit.data,
+            KittyImageData::SharedMem {
+                data_size: None,
+                ..
+            }
+        );
         let data = transmit
             .data
             .load_data()
             .context("data should have been materialized in coalesce_kitty_accumulation")?;
 
-        let data = match transmit.compression {
+        let mut data = match transmit.compression {
             KittyImageCompression::None => data,
             KittyImageCompression::Deflate => {
                 miniz_oxide::inflate::decompress_to_vec_zlib(&data)
@@ -785,6 +793,19 @@ impl TerminalState {
                 };
 
                 check_image_dimensions(width, height)?;
+
+                // Kitty reads exactly s x v x bytes-per-pixel when no size is given.
+                if from_shm_unsized {
+                    let bytes_per_pixel = if transmit.format == Some(KittyImageFormat::Rgb) {
+                        3
+                    } else {
+                        4
+                    };
+                    let wanted = width as usize * height as usize * bytes_per_pixel;
+                    if data.len() > wanted {
+                        data.truncate(wanted);
+                    }
+                }
 
                 let data = match transmit.format {
                     Some(KittyImageFormat::Rgb) => {
@@ -807,7 +828,11 @@ impl TerminalState {
                     width * height * 4
                 );
 
-                ImageDataType::new_single_frame(width, height, data)
+                if data.len() >= ImageDataType::STREAMED_FRAME_BYTES {
+                    ImageDataType::new_single_frame_streamed(width, height, data)
+                } else {
+                    ImageDataType::new_single_frame(width, height, data)
+                }
             }
             Some(KittyImageFormat::Png) => {
                 let info = dimensions(&data)?;
@@ -827,6 +852,8 @@ impl TerminalState {
         transmit: KittyImageTransmit,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<u32> {
+        // The client named the image with i= (or I=): that is who a reply is for.
+        let named_by_id = transmit.image_id.is_some();
         let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
         self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
 
@@ -835,7 +862,7 @@ impl TerminalState {
             .context("storing image data")?;
         self.kitty_img.record_id_to_data(image_id, img);
 
-        if image_number.is_some() {
+        if named_by_id || image_number.is_some() {
             self.kitty_send_response(
                 verbosity,
                 true,

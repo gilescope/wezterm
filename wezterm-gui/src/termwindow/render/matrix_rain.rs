@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::cell::CellAttributes;
+use termwiz::image::{ImageCell, TextureCoordinate};
 use wezterm_bidi::Direction;
 use wezterm_font::GlyphInfo;
 use window::WindowOps;
@@ -74,6 +75,21 @@ fn is_scrub(since_last: Option<Duration>) -> bool {
 /// Has the hold ending at `until` run out at `now`?
 fn hold_released(now: Instant, until: Instant) -> bool {
     now >= until
+}
+
+/// A pane sets this user variable (to anything non-empty) while it has nothing to
+/// show yet: a browser tab unloaded to save memory, about to be reloaded. A switch
+/// to it holds the rain until its picture arrives, hiding the load.
+pub const HOLD_RAIN_VAR: &str = "wezterm_hold_rain_for_picture";
+/// How long the rain waits for such a pane's picture before resolving anyway.
+const PICTURE_WAIT_MS: u64 = 2500;
+/// The share of a pane's cells that must hold a picture for it to count as arrived.
+const PICTURE_SHARE: f32 = 0.5;
+
+/// Is the hold over? At `until` always; sooner when it was waiting for the
+/// pane's picture and the picture is there.
+fn hold_over(now: Instant, until: Instant, wait_picture: bool, has_picture: bool) -> bool {
+    hold_released(now, until) || (wait_picture && has_picture)
 }
 
 /// Chance that a tab switch decodes an easter-egg figure into the rain.
@@ -234,6 +250,8 @@ pub struct TabSwitchAnim {
     /// Set once a scroll has stopped: the rain, which has run on one time base
     /// since the first switch, now resolves into the tab (`cells`) behind a front.
     landed_at: Option<Instant>,
+    /// The hold ends early once the pane shows its picture (see `HOLD_RAIN_VAR`).
+    wait_picture: bool,
     pane_id: PaneId,
     cols: usize,
     rows: usize,
@@ -242,6 +260,8 @@ pub struct TabSwitchAnim {
     /// Outgoing screen graphemes, same layout. Empty when there was no
     /// comparable previous screen (then the dissolve phase is skipped).
     old_cells: Vec<String>,
+    /// Outgoing screen pictures, same layout; empty when it had none.
+    old_images: Vec<Vec<ImageCell>>,
     /// Deepest changed row per column; `-1` means the column is unchanged and
     /// is skipped entirely.
     depth: Vec<i32>,
@@ -285,6 +305,81 @@ fn capture_screen(pane: &Arc<dyn Pane>) -> (usize, usize, Vec<String>) {
     (cols, rows, cells)
 }
 
+/// The picture (if any) in each cell of `pane`'s viewport, row-major like
+/// `capture_screen`. Empty when the screen holds no picture at all.
+fn capture_images(pane: &Arc<dyn Pane>, cols: usize, rows: usize) -> Vec<Vec<ImageCell>> {
+    let dims = pane.get_dimensions();
+    let top = dims.physical_top;
+    let (_first, lines) = pane.get_lines(top..top + rows as isize);
+    let mut images = vec![Vec::new(); cols * rows];
+    let mut any = false;
+    for (r, line) in lines.iter().enumerate().take(rows) {
+        for c in 0..cols {
+            // Every picture in the cell, bottom to top: a browser pane stacks a
+            // mostly transparent toolbar layer over its page.
+            let mut stack = line
+                .get_cell(c)
+                .and_then(|cell| cell.attrs().images())
+                .unwrap_or_default();
+            stack.sort_by_key(|image| image.z_index());
+            any |= !stack.is_empty();
+            images[r * cols + c] = stack;
+        }
+    }
+    if any {
+        images
+    } else {
+        Vec::new()
+    }
+}
+
+/// Per column, the deepest row that differs between two screens of the same
+/// size (`-1`: the column is unchanged and is left alone). A cell differs when
+/// its text does, or when either screen has a picture there: a pane showing a
+/// picture (a browser) is blank text, yet all of it must leave or arrive.
+fn changed_depth(
+    cols: usize,
+    rows: usize,
+    old: &[String],
+    new: &[String],
+    old_picture: &[bool],
+    new_picture: &[bool],
+) -> Vec<i32> {
+    let mut depth = vec![-1i32; cols];
+    for c in 0..cols {
+        for r in 0..rows {
+            let i = r * cols + c;
+            if old[i] != new[i] || old_picture[i] || new_picture[i] {
+                depth[c] = r as i32;
+            }
+        }
+    }
+    depth
+}
+
+/// The share (0..=1) of `pane`'s viewport cells that hold a picture.
+fn picture_share(pane: &Arc<dyn Pane>) -> f32 {
+    let dims = pane.get_dimensions();
+    let (cols, rows) = (dims.cols, dims.viewport_rows);
+    if cols == 0 || rows == 0 {
+        return 0.0;
+    }
+    let with = capture_images(pane, cols, rows)
+        .iter()
+        .filter(|stack| !stack.is_empty())
+        .count();
+    with as f32 / (cols * rows) as f32
+}
+
+/// Which cells of a captured picture grid hold a picture (all false when the grid is empty).
+fn picture_flags(images: &[Vec<ImageCell>], cells: usize) -> Vec<bool> {
+    if images.is_empty() {
+        vec![false; cells]
+    } else {
+        images.iter().map(|stack| !stack.is_empty()).collect()
+    }
+}
+
 impl crate::TermWindow {
     /// The pane the active transition is animating, if any.
     pub fn matrix_rain_pane_id(&self) -> Option<PaneId> {
@@ -305,26 +400,26 @@ impl crate::TermWindow {
 
         // Per-column deepest changed row. When the previous screen has the same
         // dimensions we diff cell-by-cell; otherwise treat everything as changed.
-        let mut depth = vec![-1i32; cols];
         let prev = prev_pane.as_ref().map(capture_screen);
-        let old_cells = match prev {
-            Some((pc, pr, pcells)) if pc == cols && pr == rows => {
-                for c in 0..cols {
-                    for r in 0..rows {
-                        if pcells[r * cols + c] != cells[r * cols + c] {
-                            depth[c] = r as i32;
-                        }
-                    }
-                }
-                pcells
+        let (depth, old_cells, old_images) = match (prev, prev_pane.as_ref()) {
+            (Some((pc, pr, pcells)), Some(prev_pane)) if pc == cols && pr == rows => {
+                // A picture pane (a browser) falls away, or arrives, like text does.
+                let old_images = capture_images(prev_pane, cols, rows);
+                let new_images = capture_images(new_pane, cols, rows);
+                let depth = changed_depth(
+                    cols,
+                    rows,
+                    &pcells,
+                    &cells,
+                    &picture_flags(&old_images, cols * rows),
+                    &picture_flags(&new_images, cols * rows),
+                );
+                (depth, pcells, old_images)
             }
             _ => {
                 // No comparable previous screen: rebuild every column fully and
                 // skip the dissolve phase (no old grid to fall away).
-                for d in depth.iter_mut() {
-                    *d = rows as i32 - 1;
-                }
-                Vec::new()
+                (vec![rows as i32 - 1; cols], Vec::new(), Vec::new())
             }
         };
 
@@ -345,11 +440,13 @@ impl crate::TermWindow {
             start: Instant::now(),
             hold_until: None,
             landed_at: None,
+            wait_picture: false,
             pane_id: new_pane.pane_id(),
             cols,
             rows,
             cells,
             old_cells,
+            old_images,
             depth,
             // Real glyphs are shaped lazily, on demand, as cells resolve — so
             // we never pay for the whole screen up front (which could stall).
@@ -374,16 +471,26 @@ impl crate::TermWindow {
             .tab_switch_anim
             .as_ref()
             .map_or(false, |a| a.hold_until.is_some());
-        if !is_scrub(since) && !in_scroll {
+        let wait_picture = new_pane
+            .copy_user_vars()
+            .get(HOLD_RAIN_VAR)
+            .map_or(false, |v| !v.is_empty());
+        if !is_scrub(since) && !in_scroll && !wait_picture {
             self.start_matrix_rain(prev_pane, new_pane);
             return;
         }
-        let until = now + Duration::from_millis(SETTLE_MS);
+        let wait_ms = if wait_picture {
+            PICTURE_WAIT_MS
+        } else {
+            SETTLE_MS
+        };
+        let until = now + Duration::from_millis(wait_ms);
         match self.tab_switch_anim.as_mut() {
             // Already holding: keep the rain flowing, just push the end out.
             Some(a) if a.hold_until.is_some() => {
                 a.hold_until = Some(until);
                 a.landed_at = None; // scrolling again: the rain has no destination
+                a.wait_picture = wait_picture;
                 a.pane_id = new_pane.pane_id();
             }
             _ => {
@@ -391,11 +498,13 @@ impl crate::TermWindow {
                     start: now,
                     hold_until: Some(until),
                     landed_at: None,
+                    wait_picture,
                     pane_id: new_pane.pane_id(),
                     cols: 0,
                     rows: 0,
                     cells: Vec::new(),
                     old_cells: Vec::new(),
+                    old_images: Vec::new(),
                     depth: Vec::new(),
                     glyphs: RefCell::new(HashMap::new()),
                     egg: None,
@@ -849,6 +958,54 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Emit the slice of a picture one cell holds, at cell (col, row_f): the
+    /// outgoing screen's picture falls with its column, as its text does.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_matrix_image(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        glyph_cache: &mut crate::glyphcache::GlyphCache,
+        image: &ImageCell,
+        ox: f32,
+        oy: f32,
+        cell_w: f32,
+        cell_h: f32,
+        col: usize,
+        row_f: f32,
+        left_off: f32,
+        top_off: f32,
+    ) -> anyhow::Result<()> {
+        // Same lookup as the pane renderer, so the texture is the one already cached.
+        let padding = (cell_h.max(cell_w) as usize).next_power_of_two();
+        let (sprite, _next_due, _load_state) =
+            glyph_cache.cached_image(image.image_data(), Some(padding), self.allow_images)?;
+        let width = sprite.coords.size.width as f32;
+        let height = sprite.coords.size.height as f32;
+        let texture_width = sprite.texture.width() as f32;
+        let texture_height = sprite.texture.height() as f32;
+        let (top_left, bottom_right): (TextureCoordinate, TextureCoordinate) =
+            (image.top_left(), image.bottom_right());
+        let texture_rect = window::bitmaps::TextureRect::new(
+            window::bitmaps::TextureCoord::new(
+                (sprite.coords.origin.x as f32 + *top_left.x * width) / texture_width,
+                (sprite.coords.origin.y as f32 + *top_left.y * height) / texture_height,
+            ),
+            window::bitmaps::TextureSize::new(
+                (*bottom_right.x - *top_left.x) * width / texture_width,
+                (*bottom_right.y - *top_left.y) * height / texture_height,
+            ),
+        );
+        let x = ox + col as f32 * cell_w - left_off;
+        let y = oy + row_f * cell_h - top_off;
+        let mut quad = layers.allocate(LAYER)?;
+        quad.set_position(x, y, x + cell_w, y + cell_h);
+        quad.set_hsv(None);
+        quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
+        quad.set_texture(texture_rect);
+        quad.set_has_color(true);
+        Ok(())
+    }
+
     /// Emit one glyph quad at cell (col, row) placed on the text baseline, as
     /// the pane renderer does, so a line of prose reads as a line of prose.
     /// (`emit_matrix_glyph` centres each bitmap in its cell, which is right
@@ -916,7 +1073,16 @@ impl crate::TermWindow {
         // front revealing the tab you landed on.
         if let Some(until) = hold_until {
             let landed = self.tab_switch_anim.as_ref().and_then(|a| a.landed_at);
-            if landed.is_none() && hold_released(Instant::now(), until) {
+            let wait_picture = self
+                .tab_switch_anim
+                .as_ref()
+                .map_or(false, |a| a.wait_picture);
+            let has_picture = landed.is_none()
+                && wait_picture
+                && self
+                    .get_active_pane_or_overlay()
+                    .map_or(false, |pane| picture_share(&pane) >= PICTURE_SHARE);
+            if landed.is_none() && hold_over(Instant::now(), until, wait_picture, has_picture) {
                 if let Some(pane) = self.get_active_pane_or_overlay() {
                     let (cols, rows, cells) = capture_screen(&pane);
                     if let Some(a) = self.tab_switch_anim.as_mut() {
@@ -1104,6 +1270,22 @@ impl crate::TermWindow {
                     let yrow = r as f32 + cd.fall;
                     if yrow > cd.depth as f32 + 0.999 {
                         continue; // off the bottom of the changed region
+                    }
+                    let stack = anim.old_images.get(r as usize * anim.cols + c);
+                    for image in stack.into_iter().flatten() {
+                        self.emit_matrix_image(
+                            layers,
+                            &mut glyph_cache,
+                            image,
+                            ox,
+                            oy,
+                            cell_w,
+                            cell_h,
+                            c,
+                            yrow,
+                            left_off,
+                            top_off,
+                        )?;
                     }
                     let s = anim.old_cells[r as usize * anim.cols + c].clone();
                     if let Some(info) = self.memo_glyph(&anim.glyphs, &s, &mut shape_budget) {
@@ -1379,6 +1561,64 @@ impl crate::TermWindow {
 #[cfg(test)]
 mod scrub_test {
     use super::*;
+
+    fn text(rows: &[&str]) -> Vec<String> {
+        rows.iter()
+            .flat_map(|r| r.chars().map(|c| c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_column_is_changed_down_to_its_deepest_differing_row() {
+        let old = text(&["ab", "cd", "ef"]);
+        let new = text(&["ab", "cX", "ef"]);
+        let none = vec![false; 6];
+        assert_eq!(changed_depth(2, 3, &old, &new, &none, &none), vec![-1, 1]);
+    }
+
+    /// A browser pane is a picture over blank cells: its text never differs from
+    /// another blank screen, yet the whole picture must leave (or arrive).
+    #[test]
+    fn a_picture_counts_as_changed_wherever_it_is() {
+        let blank = text(&["  ", "  ", "  "]);
+        let none = vec![false; 6];
+        // Old screen has a picture in column 0, rows 0 and 1.
+        let old_img = vec![true, false, true, false, false, false];
+        assert_eq!(
+            changed_depth(2, 3, &blank, &blank, &old_img, &none),
+            vec![1, -1]
+        );
+        // The same picture arriving counts too.
+        assert_eq!(
+            changed_depth(2, 3, &blank, &blank, &none, &old_img),
+            vec![1, -1]
+        );
+    }
+
+    /// A pane that is still loading its picture (a browser tab being reloaded)
+    /// keeps the rain until the picture is there, however soon that is.
+    #[test]
+    fn a_hold_waiting_for_a_picture_ends_when_the_picture_arrives() {
+        let t0 = Instant::now();
+        let until = t0 + Duration::from_millis(PICTURE_WAIT_MS);
+        assert!(!hold_over(t0, until, true, false));
+        assert!(hold_over(t0, until, true, true));
+    }
+
+    #[test]
+    fn a_hold_waiting_for_a_picture_gives_up_at_its_limit() {
+        let t0 = Instant::now();
+        let until = t0 + Duration::from_millis(PICTURE_WAIT_MS);
+        assert!(hold_over(until, until, true, false));
+    }
+
+    #[test]
+    fn a_picture_does_not_cut_an_ordinary_scroll_short() {
+        let t0 = Instant::now();
+        let until = t0 + Duration::from_millis(SETTLE_MS);
+        assert!(!hold_over(t0, until, false, true));
+        assert!(hold_over(until, until, false, true));
+    }
 
     #[test]
     fn a_first_switch_is_not_a_scrub() {

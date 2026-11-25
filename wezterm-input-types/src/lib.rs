@@ -1925,6 +1925,16 @@ impl KeyEvent {
                 // more plumbing, so for now, we're assuming the US layout.
                 let c = us_layout_unshift(shifted_key);
 
+                // A key that had to be unshifted was typed with Shift, whatever the
+                // event says: the macOS text-input path delivers `@` or `A` with no
+                // modifiers at all. A receiver only takes the shifted alternate when
+                // Shift is reported, so without this it would see `2` or `a`.
+                let modifiers = if c != shifted_key {
+                    ((modifiers - 1) | 1) + 1
+                } else {
+                    modifiers
+                };
+
                 let base_layout = self
                     .raw
                     .as_ref()
@@ -2342,6 +2352,36 @@ mod test {
         );
     }
 
+    /// The macOS text-input path reports a shifted key as the character alone
+    /// (`@`, `A`) with no modifiers. The encoding names the unshifted key and puts
+    /// the typed character in the alternate, which a receiver only uses when Shift
+    /// is set: without it `@` arrives as `2` and `A` as `a`.
+    #[test]
+    fn encode_kitty_shifted_char_without_modifiers_reports_shift() {
+        let flags = KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KittyKeyboardFlags::REPORT_EVENT_TYPES
+            | KittyKeyboardFlags::REPORT_ALTERNATE_KEYS
+            | KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+        let typed = |c: char| {
+            KeyEvent {
+                key: KeyCode::Char(c),
+                modifiers: Modifiers::NONE,
+                leds: KeyboardLedStatus::empty(),
+                repeat_count: 1,
+                key_is_down: true,
+                raw: None,
+                #[cfg(windows)]
+                win32_uni_char: None,
+            }
+            .encode_kitty(flags)
+        };
+        assert_eq!(typed('@'), "\x1b[50:64;2u");
+        assert_eq!(typed('A'), "\x1b[97:65;2u");
+        // Keys that needed no Shift are untouched.
+        assert_eq!(typed('2'), "\x1b[50;1u");
+        assert_eq!(typed('a'), "\x1b[97;1u");
+    }
+
     #[test]
     fn encode_issue_3473() {
         let flags = KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -2579,7 +2619,9 @@ mod test {
                 win32_uni_char: None,
             }
             .encode_kitty(flags),
-            "\u{1b}[97:65;1u".to_string()
+            // Shift is reported even though the event carries no modifiers: see
+            // encode_kitty_shifted_char_without_modifiers_reports_shift.
+            "\u{1b}[97:65;2u".to_string()
         );
         assert_eq!(
             KeyEvent {
@@ -2593,7 +2635,7 @@ mod test {
                 win32_uni_char: None,
             }
             .encode_kitty(flags),
-            "\u{1b}[97:65;1:3u".to_string()
+            "\u{1b}[97:65;2:3u".to_string()
         );
     }
 

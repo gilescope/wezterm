@@ -8,6 +8,61 @@ User facing docs and guide at: https://wezterm.org/
 
 *Screenshot of wezterm on macOS, running vim*
 
+## This fork: tab supremacy
+
+This is [gilescope](https://github.com/gilescope)'s fork. It keeps up with
+upstream and adds a tab bar that does more than any browser's. Everything is
+opt-in through the config; each name below has a page under `docs/config/lua`.
+
+### The tab bar
+
+| Feature                                                | How                                                                          |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| Tab bar down the side                                  | `tab_bar_position = "Left"` or `"Right"`, `tab_bar_width`                    |
+| Nested tabs: root tabs, each with child tabs           | `SpawnChildTab`, `ActivateRootRelative`, `tab:get_parent()` / `set_parent()` |
+| Back and forward through the tabs you have shown       | `show_tab_history_buttons_in_tab_bar`, `ActivateTabHistory`                  |
+| Search tabs by title, directory, program or page       | `show_tab_search_in_tab_bar`, `ShowTabSearch`, `tab:set_search_items()`      |
+| A button for a browser tab                             | `show_browser_button_in_tab_bar`, `browser_button_label`                     |
+| Reorder tabs                                           | `MoveTabRelative`                                                            |
+| See what a tab's program is doing, or that it finished | `pane:get_program_status()`, `pane:has_unseen_command_result()`              |
+
+### Switching tabs
+
+* **Matrix rain** plays between tabs: the old tab falls away, pictures included,
+  as the new one builds, with the occasional film quote decoded into the rain.
+* **Scrolling through tabs** holds the rain with no destination until you stop,
+  then resolves into the tab you landed on.
+* **A tab that is still loading** can ask the rain to wait for its picture (the
+  `wezterm_hold_rain_for_picture` user variable), so the load hides in the effect.
+* **A resume card** can greet you when you return to a tab after a while away:
+  the `tab-activated` event and `window:show_card()`.
+
+### A browser in a tab
+
+The Kitty graphics fixes here let [awrit](https://github.com/gilescope/awrit)
+draw Chromium into a pane on macOS, so a web page is a child tab like any other.
+Use awrit at
+[`300a30b`](https://github.com/gilescope/awrit/tree/300a30bcd58dec655280ef8adde8f53f4b4f1298)
+or later, which has the wezterm side of this (mouse scale, popups in the pane, a
+top bar):
+
+* a transmit naming its image with `i=` is acknowledged;
+* shared-memory frames work on macOS, and are not hashed when large;
+* a shifted key reports Shift under the Kitty keyboard protocol, so `@` arrives as `@`.
+
+Set `enable_kitty_graphics` and `enable_kitty_keyboard`. The Lua that opens,
+unloads and reloads the browser tabs is not in this repository yet.
+
+### Smaller things
+
+* **Plain-click links** even when the program in the pane has grabbed the mouse:
+  `click_hyperlinks_when_mouse_grabbed`.
+* **Cmd-C** reaches a mouse-grabbing program when wezterm has no selection.
+* **Paste** goes into the tab search box while it is open.
+* **Scrollback survives a restart**: `pane:save_scrollback()` and `pane:load_scrollback()`.
+* **Place a window over the pane area** from Lua: `window:get_position()`, and
+  `content_left` / `content_top` in `window:get_dimensions()`.
+
 ## Installation
 
 https://wezterm.org/installation

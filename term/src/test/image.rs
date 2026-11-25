@@ -195,3 +195,65 @@ fn kitty_transmit_without_an_id_is_not_acknowledged() {
     let seq = format!("\x1b_G{PIXEL}\x1b\\");
     std::assert_eq!(answer_to(&seq), "");
 }
+
+/// Standard base64 (RFC 4648, with padding) of `bytes`; the test crate has no base64 dependency.
+#[cfg(target_os = "macos")]
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                ABC[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// macOS rounds a shared-memory object up to whole pages, so a 4x4 RGBA frame
+/// (64 bytes) is read back as 16384. The terminal must use only the pixels the
+/// transmit describes (`s` x `v` x bytes per pixel), as Kitty does, not the padding.
+#[test]
+#[cfg(target_os = "macos")]
+fn kitty_shared_memory_frame_ignores_the_padding_macos_adds() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    const HELPER: &str = "import _posixshmem,os,mmap,sys\n\
+        n='/wzt_%d'%os.getpid()\n\
+        fd=_posixshmem.shm_open(n,os.O_CREAT|os.O_RDWR,0o600)\n\
+        os.ftruncate(fd,64)\n\
+        m=mmap.mmap(fd,64)\n\
+        m[:64]=bytes(range(64))\n\
+        print(n,flush=True)\n\
+        sys.stdin.read()\n";
+    let mut child = match Command::new("python3")
+        .args(["-I", "-c", HELPER])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("skipped: python3 is needed to create shared memory: {err}");
+            return;
+        }
+    };
+    let mut name = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut name)
+        .unwrap();
+    let seq = format!(
+        "\x1b_Gf=32,t=s,s=4,v=4,i=9;{}\x1b\\",
+        base64(name.trim().as_bytes())
+    );
+    std::assert_eq!(answer_to(&seq), "\x1b_Gi=9;OK\x1b\\");
+    drop(child.stdin.take());
+    child.wait().unwrap();
+}

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::cell::CellAttributes;
+use termwiz::image::{ImageCell, TextureCoordinate};
 use wezterm_bidi::Direction;
 use wezterm_font::GlyphInfo;
 use window::WindowOps;
@@ -242,6 +243,8 @@ pub struct TabSwitchAnim {
     /// Outgoing screen graphemes, same layout. Empty when there was no
     /// comparable previous screen (then the dissolve phase is skipped).
     old_cells: Vec<String>,
+    /// Outgoing screen pictures, same layout; empty when it had none.
+    old_images: Vec<Option<ImageCell>>,
     /// Deepest changed row per column; `-1` means the column is unchanged and
     /// is skipped entirely.
     depth: Vec<i32>,
@@ -285,6 +288,64 @@ fn capture_screen(pane: &Arc<dyn Pane>) -> (usize, usize, Vec<String>) {
     (cols, rows, cells)
 }
 
+/// The picture (if any) in each cell of `pane`'s viewport, row-major like
+/// `capture_screen`. Empty when the screen holds no picture at all.
+fn capture_images(pane: &Arc<dyn Pane>, cols: usize, rows: usize) -> Vec<Option<ImageCell>> {
+    let dims = pane.get_dimensions();
+    let top = dims.physical_top;
+    let (_first, lines) = pane.get_lines(top..top + rows as isize);
+    let mut images = vec![None; cols * rows];
+    let mut any = false;
+    for (r, line) in lines.iter().enumerate().take(rows) {
+        for c in 0..cols {
+            let image = line
+                .get_cell(c)
+                .and_then(|cell| cell.attrs().images())
+                .and_then(|mut all| all.pop());
+            any |= image.is_some();
+            images[r * cols + c] = image;
+        }
+    }
+    if any {
+        images
+    } else {
+        Vec::new()
+    }
+}
+
+/// Per column, the deepest row that differs between two screens of the same
+/// size (`-1`: the column is unchanged and is left alone). A cell differs when
+/// its text does, or when either screen has a picture there: a pane showing a
+/// picture (a browser) is blank text, yet all of it must leave or arrive.
+fn changed_depth(
+    cols: usize,
+    rows: usize,
+    old: &[String],
+    new: &[String],
+    old_picture: &[bool],
+    new_picture: &[bool],
+) -> Vec<i32> {
+    let mut depth = vec![-1i32; cols];
+    for c in 0..cols {
+        for r in 0..rows {
+            let i = r * cols + c;
+            if old[i] != new[i] || old_picture[i] || new_picture[i] {
+                depth[c] = r as i32;
+            }
+        }
+    }
+    depth
+}
+
+/// Which cells of a captured picture grid hold a picture (all false when the grid is empty).
+fn picture_flags(images: &[Option<ImageCell>], cells: usize) -> Vec<bool> {
+    if images.is_empty() {
+        vec![false; cells]
+    } else {
+        images.iter().map(Option::is_some).collect()
+    }
+}
+
 impl crate::TermWindow {
     /// The pane the active transition is animating, if any.
     pub fn matrix_rain_pane_id(&self) -> Option<PaneId> {
@@ -305,26 +366,26 @@ impl crate::TermWindow {
 
         // Per-column deepest changed row. When the previous screen has the same
         // dimensions we diff cell-by-cell; otherwise treat everything as changed.
-        let mut depth = vec![-1i32; cols];
         let prev = prev_pane.as_ref().map(capture_screen);
-        let old_cells = match prev {
-            Some((pc, pr, pcells)) if pc == cols && pr == rows => {
-                for c in 0..cols {
-                    for r in 0..rows {
-                        if pcells[r * cols + c] != cells[r * cols + c] {
-                            depth[c] = r as i32;
-                        }
-                    }
-                }
-                pcells
+        let (depth, old_cells, old_images) = match (prev, prev_pane.as_ref()) {
+            (Some((pc, pr, pcells)), Some(prev_pane)) if pc == cols && pr == rows => {
+                // A picture pane (a browser) falls away, or arrives, like text does.
+                let old_images = capture_images(prev_pane, cols, rows);
+                let new_images = capture_images(new_pane, cols, rows);
+                let depth = changed_depth(
+                    cols,
+                    rows,
+                    &pcells,
+                    &cells,
+                    &picture_flags(&old_images, cols * rows),
+                    &picture_flags(&new_images, cols * rows),
+                );
+                (depth, pcells, old_images)
             }
             _ => {
                 // No comparable previous screen: rebuild every column fully and
                 // skip the dissolve phase (no old grid to fall away).
-                for d in depth.iter_mut() {
-                    *d = rows as i32 - 1;
-                }
-                Vec::new()
+                (vec![rows as i32 - 1; cols], Vec::new(), Vec::new())
             }
         };
 
@@ -350,6 +411,7 @@ impl crate::TermWindow {
             rows,
             cells,
             old_cells,
+            old_images,
             depth,
             // Real glyphs are shaped lazily, on demand, as cells resolve — so
             // we never pay for the whole screen up front (which could stall).
@@ -396,6 +458,7 @@ impl crate::TermWindow {
                     rows: 0,
                     cells: Vec::new(),
                     old_cells: Vec::new(),
+                    old_images: Vec::new(),
                     depth: Vec::new(),
                     glyphs: RefCell::new(HashMap::new()),
                     egg: None,
@@ -849,6 +912,54 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Emit the slice of a picture one cell holds, at cell (col, row_f): the
+    /// outgoing screen's picture falls with its column, as its text does.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_matrix_image(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        glyph_cache: &mut crate::glyphcache::GlyphCache,
+        image: &ImageCell,
+        ox: f32,
+        oy: f32,
+        cell_w: f32,
+        cell_h: f32,
+        col: usize,
+        row_f: f32,
+        left_off: f32,
+        top_off: f32,
+    ) -> anyhow::Result<()> {
+        // Same lookup as the pane renderer, so the texture is the one already cached.
+        let padding = (cell_h.max(cell_w) as usize).next_power_of_two();
+        let (sprite, _next_due, _load_state) =
+            glyph_cache.cached_image(image.image_data(), Some(padding), self.allow_images)?;
+        let width = sprite.coords.size.width as f32;
+        let height = sprite.coords.size.height as f32;
+        let texture_width = sprite.texture.width() as f32;
+        let texture_height = sprite.texture.height() as f32;
+        let (top_left, bottom_right): (TextureCoordinate, TextureCoordinate) =
+            (image.top_left(), image.bottom_right());
+        let texture_rect = window::bitmaps::TextureRect::new(
+            window::bitmaps::TextureCoord::new(
+                (sprite.coords.origin.x as f32 + *top_left.x * width) / texture_width,
+                (sprite.coords.origin.y as f32 + *top_left.y * height) / texture_height,
+            ),
+            window::bitmaps::TextureSize::new(
+                (*bottom_right.x - *top_left.x) * width / texture_width,
+                (*bottom_right.y - *top_left.y) * height / texture_height,
+            ),
+        );
+        let x = ox + col as f32 * cell_w - left_off;
+        let y = oy + row_f * cell_h - top_off;
+        let mut quad = layers.allocate(LAYER)?;
+        quad.set_position(x, y, x + cell_w, y + cell_h);
+        quad.set_hsv(None);
+        quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
+        quad.set_texture(texture_rect);
+        quad.set_has_color(true);
+        Ok(())
+    }
+
     /// Emit one glyph quad at cell (col, row) placed on the text baseline, as
     /// the pane renderer does, so a line of prose reads as a line of prose.
     /// (`emit_matrix_glyph` centres each bitmap in its cell, which is right
@@ -1104,6 +1215,21 @@ impl crate::TermWindow {
                     let yrow = r as f32 + cd.fall;
                     if yrow > cd.depth as f32 + 0.999 {
                         continue; // off the bottom of the changed region
+                    }
+                    if let Some(Some(image)) = anim.old_images.get(r as usize * anim.cols + c) {
+                        self.emit_matrix_image(
+                            layers,
+                            &mut glyph_cache,
+                            image,
+                            ox,
+                            oy,
+                            cell_w,
+                            cell_h,
+                            c,
+                            yrow,
+                            left_off,
+                            top_off,
+                        )?;
                     }
                     let s = anim.old_cells[r as usize * anim.cols + c].clone();
                     if let Some(info) = self.memo_glyph(&anim.glyphs, &s, &mut shape_budget) {
@@ -1379,6 +1505,39 @@ impl crate::TermWindow {
 #[cfg(test)]
 mod scrub_test {
     use super::*;
+
+    fn text(rows: &[&str]) -> Vec<String> {
+        rows.iter()
+            .flat_map(|r| r.chars().map(|c| c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_column_is_changed_down_to_its_deepest_differing_row() {
+        let old = text(&["ab", "cd", "ef"]);
+        let new = text(&["ab", "cX", "ef"]);
+        let none = vec![false; 6];
+        assert_eq!(changed_depth(2, 3, &old, &new, &none, &none), vec![-1, 1]);
+    }
+
+    /// A browser pane is a picture over blank cells: its text never differs from
+    /// another blank screen, yet the whole picture must leave (or arrive).
+    #[test]
+    fn a_picture_counts_as_changed_wherever_it_is() {
+        let blank = text(&["  ", "  ", "  "]);
+        let none = vec![false; 6];
+        // Old screen has a picture in column 0, rows 0 and 1.
+        let old_img = vec![true, false, true, false, false, false];
+        assert_eq!(
+            changed_depth(2, 3, &blank, &blank, &old_img, &none),
+            vec![1, -1]
+        );
+        // The same picture arriving counts too.
+        assert_eq!(
+            changed_depth(2, 3, &blank, &blank, &none, &old_img),
+            vec![1, -1]
+        );
+    }
 
     #[test]
     fn a_first_switch_is_not_a_scrub() {

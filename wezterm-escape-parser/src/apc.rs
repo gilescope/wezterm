@@ -262,7 +262,80 @@ impl KittyImageData {
     }
 }
 
-#[cfg(all(feature = "kitty-shm", unix, not(target_os = "android")))]
+/// macOS gives POSIX shared memory no `read()`, `write()` or `seek()`: only `mmap`
+/// works, so the generic reader below fails there with "Device not configured".
+#[cfg(all(feature = "kitty-shm", target_os = "macos"))]
+fn read_shared_memory_data(
+    name: &str,
+    data_offset: Option<u32>,
+    data_size: Option<u32>,
+) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
+    use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap, shm_open, shm_unlink};
+    use std::io::{Error, ErrorKind};
+    use std::num::NonZeroUsize;
+
+    let other = |msg: String| Error::new(ErrorKind::Other, msg);
+    let fd = shm_open(
+        name,
+        nix::fcntl::OFlag::O_RDONLY,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|err| other(format!("shm_open {name} failed: {err}")))?;
+    let total = nix::sys::stat::fstat(std::os::fd::AsRawFd::as_raw_fd(&fd))
+        .map_err(|err| other(format!("fstat {name} failed: {err}")))
+        .and_then(|st| {
+            usize::try_from(st.st_size).map_err(|_| other(format!("{name} has a negative size")))
+        })?;
+    let offset = data_offset.unwrap_or(0) as usize;
+    let len = data_size.map_or(total.saturating_sub(offset), |l| l as usize);
+    let end = offset.checked_add(len).filter(|end| *end <= total);
+    let result = match (end, NonZeroUsize::new(total)) {
+        (Some(_), Some(map_len)) => {
+            // SAFETY: the mapping is read-only and private to this call, its length is
+            // the object's own size from fstat, and `offset + len <= total` was checked
+            // above, so the slice stays inside it. The bytes are copied out and the
+            // mapping released before leaving the block, so nothing borrows it after.
+            // Residual risk: a process that shrinks the object while it is mapped makes
+            // a read of the vanished pages fault (SIGBUS); the sender is the program
+            // writing to this terminal, and it already controls what is drawn.
+            unsafe {
+                mmap(
+                    None,
+                    map_len,
+                    ProtFlags::PROT_READ,
+                    MapFlags::MAP_SHARED,
+                    &fd,
+                    0,
+                )
+                .map(|ptr| {
+                    let bytes =
+                        std::slice::from_raw_parts(ptr.as_ptr().cast::<u8>().add(offset), len)
+                            .to_vec();
+                    let _ = munmap(ptr, total);
+                    bytes
+                })
+                .map_err(|err| other(format!("mmap {name} failed: {err}")))
+            }
+        }
+        (Some(_), None) => Ok(std::vec::Vec::new()),
+        (None, _) => Err(other(format!(
+            "offset {offset} + size {len} is past the end of {name} ({total} bytes)"
+        ))),
+    };
+
+    // Kitty: the terminal removes the object once it has read it, even on failure.
+    if let Err(err) = shm_unlink(name) {
+        log::warn!("Unable to unlink kitty image protocol shm file {name}: {err:#}");
+    }
+    result
+}
+
+#[cfg(all(
+    feature = "kitty-shm",
+    unix,
+    not(target_os = "android"),
+    not(target_os = "macos")
+))]
 fn read_shared_memory_data(
     name: &str,
     data_offset: Option<u32>,
@@ -1278,5 +1351,87 @@ mod test {
                 },
             }
         );
+    }
+
+    /// A POSIX shared-memory object holding `hello shm` at its start, kept alive by a
+    /// helper process until its stdin closes. macOS offers no `read()` or `write()` on
+    /// shared memory, only `mmap`, so a helper creates it. Returns `None` (with the
+    /// reason printed) where python3 is unavailable, so the test skips instead of failing.
+    #[cfg(all(feature = "kitty-shm", target_os = "macos"))]
+    fn shm_with_hello() -> Option<(std::process::Child, String)> {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        const HELPER: &str = "import _posixshmem,os,mmap,sys\n\
+            n='/wzt_%d'%os.getpid()\n\
+            fd=_posixshmem.shm_open(n,os.O_CREAT|os.O_RDWR,0o600)\n\
+            os.ftruncate(fd,64)\n\
+            m=mmap.mmap(fd,64)\n\
+            m[:9]=b'hello shm'\n\
+            print(n,flush=True)\n\
+            sys.stdin.read()\n";
+        let mut child = match Command::new("python3")
+            .args(["-I", "-c", HELPER])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("skipped: python3 is needed to create shared memory: {err}");
+                return None;
+            }
+        };
+        let mut name = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut name)
+            .unwrap();
+        Some((child, name.trim().to_string()))
+    }
+
+    #[test]
+    #[cfg(all(feature = "kitty-shm", target_os = "macos"))]
+    fn shared_memory_is_readable_on_macos() {
+        let Some((mut helper, name)) = shm_with_hello() else {
+            return;
+        };
+        let data = read_shared_memory_data(&name, None, None).unwrap();
+        std::assert_eq!(&data[..9], b"hello shm");
+        drop(helper.stdin.take());
+        helper.wait().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(feature = "kitty-shm", target_os = "macos"))]
+    fn shared_memory_offset_and_size_select_a_slice() {
+        let Some((mut helper, name)) = shm_with_hello() else {
+            return;
+        };
+        let data = read_shared_memory_data(&name, Some(6), Some(3)).unwrap();
+        std::assert_eq!(data, b"shm");
+        drop(helper.stdin.take());
+        helper.wait().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(feature = "kitty-shm", target_os = "macos"))]
+    fn shared_memory_is_unlinked_after_a_read() {
+        let Some((mut helper, name)) = shm_with_hello() else {
+            return;
+        };
+        read_shared_memory_data(&name, None, None).unwrap();
+        assert!(read_shared_memory_data(&name, None, None).is_err());
+        drop(helper.stdin.take());
+        helper.wait().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(feature = "kitty-shm", target_os = "macos"))]
+    fn a_slice_past_the_end_is_an_error_not_a_crash() {
+        let Some((mut helper, name)) = shm_with_hello() else {
+            return;
+        };
+        assert!(read_shared_memory_data(&name, Some(60), Some(1 << 20)).is_err());
+        drop(helper.stdin.take());
+        helper.wait().unwrap();
     }
 }

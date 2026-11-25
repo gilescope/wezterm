@@ -77,6 +77,21 @@ fn hold_released(now: Instant, until: Instant) -> bool {
     now >= until
 }
 
+/// A pane sets this user variable (to anything non-empty) while it has nothing to
+/// show yet: a browser tab unloaded to save memory, about to be reloaded. A switch
+/// to it holds the rain until its picture arrives, hiding the load.
+pub const HOLD_RAIN_VAR: &str = "wezterm_hold_rain_for_picture";
+/// How long the rain waits for such a pane's picture before resolving anyway.
+const PICTURE_WAIT_MS: u64 = 2500;
+/// The share of a pane's cells that must hold a picture for it to count as arrived.
+const PICTURE_SHARE: f32 = 0.5;
+
+/// Is the hold over? At `until` always; sooner when it was waiting for the
+/// pane's picture and the picture is there.
+fn hold_over(now: Instant, until: Instant, wait_picture: bool, has_picture: bool) -> bool {
+    hold_released(now, until) || (wait_picture && has_picture)
+}
+
 /// Chance that a tab switch decodes an easter-egg figure into the rain.
 const EGG_PROBABILITY: f32 = 0.5;
 /// Centre of the egg within the transition. The rain NEVER pauses — the figure
@@ -235,6 +250,8 @@ pub struct TabSwitchAnim {
     /// Set once a scroll has stopped: the rain, which has run on one time base
     /// since the first switch, now resolves into the tab (`cells`) behind a front.
     landed_at: Option<Instant>,
+    /// The hold ends early once the pane shows its picture (see `HOLD_RAIN_VAR`).
+    wait_picture: bool,
     pane_id: PaneId,
     cols: usize,
     rows: usize,
@@ -244,7 +261,7 @@ pub struct TabSwitchAnim {
     /// comparable previous screen (then the dissolve phase is skipped).
     old_cells: Vec<String>,
     /// Outgoing screen pictures, same layout; empty when it had none.
-    old_images: Vec<Option<ImageCell>>,
+    old_images: Vec<Vec<ImageCell>>,
     /// Deepest changed row per column; `-1` means the column is unchanged and
     /// is skipped entirely.
     depth: Vec<i32>,
@@ -290,20 +307,23 @@ fn capture_screen(pane: &Arc<dyn Pane>) -> (usize, usize, Vec<String>) {
 
 /// The picture (if any) in each cell of `pane`'s viewport, row-major like
 /// `capture_screen`. Empty when the screen holds no picture at all.
-fn capture_images(pane: &Arc<dyn Pane>, cols: usize, rows: usize) -> Vec<Option<ImageCell>> {
+fn capture_images(pane: &Arc<dyn Pane>, cols: usize, rows: usize) -> Vec<Vec<ImageCell>> {
     let dims = pane.get_dimensions();
     let top = dims.physical_top;
     let (_first, lines) = pane.get_lines(top..top + rows as isize);
-    let mut images = vec![None; cols * rows];
+    let mut images = vec![Vec::new(); cols * rows];
     let mut any = false;
     for (r, line) in lines.iter().enumerate().take(rows) {
         for c in 0..cols {
-            let image = line
+            // Every picture in the cell, bottom to top: a browser pane stacks a
+            // mostly transparent toolbar layer over its page.
+            let mut stack = line
                 .get_cell(c)
                 .and_then(|cell| cell.attrs().images())
-                .and_then(|mut all| all.pop());
-            any |= image.is_some();
-            images[r * cols + c] = image;
+                .unwrap_or_default();
+            stack.sort_by_key(|image| image.z_index());
+            any |= !stack.is_empty();
+            images[r * cols + c] = stack;
         }
     }
     if any {
@@ -337,12 +357,26 @@ fn changed_depth(
     depth
 }
 
+/// The share (0..=1) of `pane`'s viewport cells that hold a picture.
+fn picture_share(pane: &Arc<dyn Pane>) -> f32 {
+    let dims = pane.get_dimensions();
+    let (cols, rows) = (dims.cols, dims.viewport_rows);
+    if cols == 0 || rows == 0 {
+        return 0.0;
+    }
+    let with = capture_images(pane, cols, rows)
+        .iter()
+        .filter(|stack| !stack.is_empty())
+        .count();
+    with as f32 / (cols * rows) as f32
+}
+
 /// Which cells of a captured picture grid hold a picture (all false when the grid is empty).
-fn picture_flags(images: &[Option<ImageCell>], cells: usize) -> Vec<bool> {
+fn picture_flags(images: &[Vec<ImageCell>], cells: usize) -> Vec<bool> {
     if images.is_empty() {
         vec![false; cells]
     } else {
-        images.iter().map(Option::is_some).collect()
+        images.iter().map(|stack| !stack.is_empty()).collect()
     }
 }
 
@@ -406,6 +440,7 @@ impl crate::TermWindow {
             start: Instant::now(),
             hold_until: None,
             landed_at: None,
+            wait_picture: false,
             pane_id: new_pane.pane_id(),
             cols,
             rows,
@@ -436,16 +471,26 @@ impl crate::TermWindow {
             .tab_switch_anim
             .as_ref()
             .map_or(false, |a| a.hold_until.is_some());
-        if !is_scrub(since) && !in_scroll {
+        let wait_picture = new_pane
+            .copy_user_vars()
+            .get(HOLD_RAIN_VAR)
+            .map_or(false, |v| !v.is_empty());
+        if !is_scrub(since) && !in_scroll && !wait_picture {
             self.start_matrix_rain(prev_pane, new_pane);
             return;
         }
-        let until = now + Duration::from_millis(SETTLE_MS);
+        let wait_ms = if wait_picture {
+            PICTURE_WAIT_MS
+        } else {
+            SETTLE_MS
+        };
+        let until = now + Duration::from_millis(wait_ms);
         match self.tab_switch_anim.as_mut() {
             // Already holding: keep the rain flowing, just push the end out.
             Some(a) if a.hold_until.is_some() => {
                 a.hold_until = Some(until);
                 a.landed_at = None; // scrolling again: the rain has no destination
+                a.wait_picture = wait_picture;
                 a.pane_id = new_pane.pane_id();
             }
             _ => {
@@ -453,6 +498,7 @@ impl crate::TermWindow {
                     start: now,
                     hold_until: Some(until),
                     landed_at: None,
+                    wait_picture,
                     pane_id: new_pane.pane_id(),
                     cols: 0,
                     rows: 0,
@@ -1027,7 +1073,16 @@ impl crate::TermWindow {
         // front revealing the tab you landed on.
         if let Some(until) = hold_until {
             let landed = self.tab_switch_anim.as_ref().and_then(|a| a.landed_at);
-            if landed.is_none() && hold_released(Instant::now(), until) {
+            let wait_picture = self
+                .tab_switch_anim
+                .as_ref()
+                .map_or(false, |a| a.wait_picture);
+            let has_picture = landed.is_none()
+                && wait_picture
+                && self
+                    .get_active_pane_or_overlay()
+                    .map_or(false, |pane| picture_share(&pane) >= PICTURE_SHARE);
+            if landed.is_none() && hold_over(Instant::now(), until, wait_picture, has_picture) {
                 if let Some(pane) = self.get_active_pane_or_overlay() {
                     let (cols, rows, cells) = capture_screen(&pane);
                     if let Some(a) = self.tab_switch_anim.as_mut() {
@@ -1216,7 +1271,8 @@ impl crate::TermWindow {
                     if yrow > cd.depth as f32 + 0.999 {
                         continue; // off the bottom of the changed region
                     }
-                    if let Some(Some(image)) = anim.old_images.get(r as usize * anim.cols + c) {
+                    let stack = anim.old_images.get(r as usize * anim.cols + c);
+                    for image in stack.into_iter().flatten() {
                         self.emit_matrix_image(
                             layers,
                             &mut glyph_cache,
@@ -1537,6 +1593,31 @@ mod scrub_test {
             changed_depth(2, 3, &blank, &blank, &none, &old_img),
             vec![1, -1]
         );
+    }
+
+    /// A pane that is still loading its picture (a browser tab being reloaded)
+    /// keeps the rain until the picture is there, however soon that is.
+    #[test]
+    fn a_hold_waiting_for_a_picture_ends_when_the_picture_arrives() {
+        let t0 = Instant::now();
+        let until = t0 + Duration::from_millis(PICTURE_WAIT_MS);
+        assert!(!hold_over(t0, until, true, false));
+        assert!(hold_over(t0, until, true, true));
+    }
+
+    #[test]
+    fn a_hold_waiting_for_a_picture_gives_up_at_its_limit() {
+        let t0 = Instant::now();
+        let until = t0 + Duration::from_millis(PICTURE_WAIT_MS);
+        assert!(hold_over(until, until, true, false));
+    }
+
+    #[test]
+    fn a_picture_does_not_cut_an_ordinary_scroll_short() {
+        let t0 = Instant::now();
+        let until = t0 + Duration::from_millis(SETTLE_MS);
+        assert!(!hold_over(t0, until, false, true));
+        assert!(hold_over(until, until, false, true));
     }
 
     #[test]

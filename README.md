@@ -8,6 +8,27 @@ User facing docs and guide at: https://wezterm.org/
 
 *Screenshot of wezterm on macOS, running vim*
 
+## This fork: tab supremacy
+
+This is [gilescope](https://github.com/gilescope)'s fork. It keeps up with
+upstream and adds a tab bar that does more than any browser's:
+
+* **Nested tabs**: a side bar of root tabs, each with its own child tabs.
+* **Back and forward** through the tabs you have shown, like a browser's history.
+* **Tab search** over titles, directories and programs, and over pages a tab carries.
+* **A browser in a tab**: the Kitty graphics fixes here (acknowledged transmits,
+  shared memory on macOS, no hashing of streamed frames) let
+  [awrit](https://github.com/gilescope/awrit) draw Chromium into a pane, so a web
+  page is a child tab like any other. The Lua that manages those tabs is not in
+  this repository yet.
+* **Matrix rain** between tabs: the old tab, pictures included, falls away as the
+  new one builds; scrolling through tabs holds the rain until you land, and it
+  waits for a tab that is still loading.
+* **Plain-click links**, even when the program in the pane has grabbed the mouse.
+* **A resume card** when you return to a tab after a while away.
+
+Most of it is opt-in through the config; see `docs/config/lua`.
+
 ## Installation
 
 https://wezterm.org/installation

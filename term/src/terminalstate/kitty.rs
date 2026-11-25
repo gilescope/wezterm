@@ -827,6 +827,8 @@ impl TerminalState {
         transmit: KittyImageTransmit,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<u32> {
+        // The client named the image with i= (or I=): that is who a reply is for.
+        let named_by_id = transmit.image_id.is_some();
         let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
         self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
 
@@ -835,7 +837,7 @@ impl TerminalState {
             .context("storing image data")?;
         self.kitty_img.record_id_to_data(image_id, img);
 
-        if image_number.is_some() {
+        if named_by_id || image_number.is_some() {
             self.kitty_send_response(
                 verbosity,
                 true,

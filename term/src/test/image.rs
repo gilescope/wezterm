@@ -124,3 +124,74 @@ fn kitty_frame_edit_keeps_the_stored_hash_current() {
 
     assert_ne!(edited_hash, transmitted_hash);
 }
+
+/// A pty writer the test can read back: what the terminal answers to an escape.
+#[derive(Clone, Default)]
+struct Answers(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Answers {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a fresh terminal writes back after being fed `seq`.
+fn answer_to(seq: &str) -> String {
+    let answers = Answers::default();
+    let mut term = Terminal::new(
+        TerminalSize {
+            rows: 3,
+            cols: 10,
+            pixel_width: 80,
+            pixel_height: 48,
+            dpi: 0,
+        },
+        Arc::new(TestTermConfig { scrollback: 0 }),
+        "WezTerm",
+        "O_o",
+        Box::new(answers.clone()),
+    );
+    // The terminal writes through a background thread, so a reply may land after
+    // `advance_bytes` returns. A device status report asked for last is answered
+    // after every earlier reply: wait for it, then strip it.
+    const STATUS_OK: &str = "\x1b[0n";
+    term.advance_bytes(seq.as_bytes());
+    term.advance_bytes(b"\x1b[5n");
+    for _ in 0..400 {
+        let text = String::from_utf8(answers.0.lock().unwrap().clone()).unwrap();
+        if let Some(before) = text.strip_suffix(STATUS_OK) {
+            return before.to_string();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("no status report reply: the terminal did not answer in 2s");
+}
+
+/// A 1x1 RGB pixel (3 bytes of data).
+const PIXEL: &str = "f=24,t=d,s=1,v=1;AAAA";
+
+/// Kitty replies `OK` to a transmit that names its image with `i=`, not only
+/// `I=`; programs probe graphics support by transmitting a pixel and waiting.
+#[test]
+fn kitty_transmit_with_an_image_id_is_acknowledged() {
+    let seq = format!("\x1b_Gi=4294111295,{PIXEL}\x1b\\");
+    std::assert_eq!(answer_to(&seq), "\x1b_Gi=4294111295;OK\x1b\\");
+}
+
+/// `q=1` asks for no `OK`.
+#[test]
+fn kitty_quiet_transmit_is_not_acknowledged() {
+    let seq = format!("\x1b_Gq=1,i=7,{PIXEL}\x1b\\");
+    std::assert_eq!(answer_to(&seq), "");
+}
+
+/// With neither `i=` nor `I=` there is nothing to name in a reply.
+#[test]
+fn kitty_transmit_without_an_id_is_not_acknowledged() {
+    let seq = format!("\x1b_G{PIXEL}\x1b\\");
+    std::assert_eq!(answer_to(&seq), "");
+}

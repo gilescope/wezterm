@@ -37,6 +37,14 @@ impl Recency {
     }
 }
 
+/// One searchable thing a tab carries beyond its panes, e.g. a page open in
+/// a browser window this tab stands for. Set from Lua; see `Tab::set_search_items`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchItem {
+    pub title: String,
+    pub url: String,
+}
+
 struct TabInner {
     id: TabId,
     pane: Option<Tree>,
@@ -49,6 +57,11 @@ struct TabInner {
     /// Root tab this one nests under in the window's tab bar (the "top
     /// row" of a side bar). `None` for a root tab.
     parent: Option<TabId>,
+    /// What tab search may hit inside this tab, in the owner's own order.
+    search_items: Vec<SearchItem>,
+    /// Index into `search_items` the user picked in tab search, until a
+    /// handler takes it.
+    search_pick: Option<usize>,
 }
 
 /// A Tab is a container of Panes
@@ -523,6 +536,31 @@ impl Tab {
         self.inner.lock().title.clone()
     }
 
+    pub fn get_search_items(&self) -> Vec<SearchItem> {
+        self.inner.lock().search_items.clone()
+    }
+
+    /// Replace the searchable items. A pick that no longer names an item is dropped.
+    pub fn set_search_items(&self, items: Vec<SearchItem>) {
+        let mut inner = self.inner.lock();
+        inner.search_items = items;
+        if inner
+            .search_pick
+            .map_or(false, |i| i >= inner.search_items.len())
+        {
+            inner.search_pick = None;
+        }
+    }
+
+    pub fn set_search_pick(&self, pick: Option<usize>) {
+        self.inner.lock().search_pick = pick;
+    }
+
+    /// The item tab search picked, once: reading it clears it.
+    pub fn take_search_pick(&self) -> Option<usize> {
+        self.inner.lock().search_pick.take()
+    }
+
     pub fn get_parent(&self) -> Option<TabId> {
         self.inner.lock().parent
     }
@@ -792,6 +830,8 @@ impl TabInner {
             title: String::new(),
             recency: Recency::default(),
             parent: None,
+            search_items: vec![],
+            search_pick: None,
         }
     }
 

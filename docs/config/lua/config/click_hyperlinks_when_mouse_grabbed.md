@@ -1,0 +1,14 @@
+---
+tags:
+  - mouse
+---
+# `click_hyperlinks_when_mouse_grabbed = false`
+
+When `true`, a plain click on a highlighted hyperlink opens it even if the
+program in the pane has enabled mouse reporting; neither the press nor the
+release is sent to the program. When `false` (the default) you must hold
+[bypass_mouse_reporting_modifiers](bypass_mouse_reporting_modifiers.md)
+(`SHIFT` by default) to click the link.
+
+Trade-off: a program that draws its own clickable text over something matching
+a hyperlink rule no longer receives that click.

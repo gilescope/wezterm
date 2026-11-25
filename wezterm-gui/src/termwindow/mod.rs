@@ -441,6 +441,8 @@ pub struct TermWindow {
     tab_bar_width_override: Option<f32>,
     /// Active matrix-rain tab-switch transition, if any.
     tab_switch_anim: Option<crate::termwindow::render::matrix_rain::TabSwitchAnim>,
+    /// When the tab last changed, to tell a scroll through tabs from one switch.
+    last_tab_switch_at: Option<Instant>,
     /// Resume card shown over the active pane; see `matrix_rain.rs`.
     resume_card: Option<crate::termwindow::render::matrix_rain::ResumeCardAnim>,
     /// Lazily-shaped katakana/digit glyph palette for the matrix rain.
@@ -794,6 +796,7 @@ impl TermWindow {
             tab_bar_scroll_offset: std::cell::Cell::new(0.),
             tab_bar_width_override: None,
             tab_switch_anim: None,
+            last_tab_switch_at: None,
             resume_card: None,
             matrix_rain_palette: None,
             right_status: String::new(),
@@ -2483,7 +2486,7 @@ impl TermWindow {
             if changed {
                 // A card belongs to the tab it was shown on.
                 self.clear_resume_card();
-                self.start_matrix_rain(prev_pane, &pane);
+                self.on_tab_switched(prev_pane, &pane);
                 let away = {
                     let mux = Mux::get();
                     let window = mux.get_window(self.mux_window_id);
@@ -3575,6 +3578,16 @@ impl TermWindow {
         Ok(PerformAssignmentResult::Handled)
     }
 
+    /// Tell the active tab which of its search items tab search picked, and
+    /// let the `search-item-picked` handler act on it (e.g. select that page).
+    pub fn pick_search_item(&mut self, item: usize) {
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        tab.set_search_pick(Some(item));
+        self.emit_window_event("search-item-picked", None);
+    }
+
     fn do_open_link_at_mouse_cursor(&self, pane: &Arc<dyn Pane>) {
         // They clicked on a link, so let's open it!
         // We need to ensure that we spawn the `open` call outside of the context
@@ -3584,6 +3597,11 @@ impl TermWindow {
         // perform below; here we allow the user to define an `open-uri` event
         // handler that can bypass the normal `open_url` functionality.
         if let Some(link) = self.current_highlight.as_ref().cloned() {
+            // Acknowledge the click now: the handler may take a while. The
+            // next mouse move restores the pointer.
+            if let Some(w) = self.window.as_ref() {
+                w.set_cursor(Some(CursorIcon::Progress));
+            }
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());
 

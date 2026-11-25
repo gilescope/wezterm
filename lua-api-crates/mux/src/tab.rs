@@ -3,6 +3,8 @@ use config::keyassignment::PaneDirection;
 use super::*;
 use luahelper::mlua::Value;
 use luahelper::{from_lua, to_lua};
+use mux::tab::SearchItem;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +47,30 @@ impl UserData for MuxTab {
             let mux = get_mux()?;
             let tab = this.resolve(&mux)?;
             Ok(tab.set_title(&title))
+        });
+        // A list of `{ title = ..., url = ... }`: what tab search may hit in a
+        // tab that stands for something outside the mux (a browser window).
+        methods.add_method(
+            "set_search_items",
+            |_, this, items: Vec<HashMap<String, String>>| {
+                let mux = get_mux()?;
+                let tab = this.resolve(&mux)?;
+                let items = items
+                    .into_iter()
+                    .map(|m| SearchItem {
+                        title: m.get("title").cloned().unwrap_or_default(),
+                        url: m.get("url").cloned().unwrap_or_default(),
+                    })
+                    .collect();
+                tab.set_search_items(items);
+                Ok(())
+            },
+        );
+        // The 1-based index of the item tab search picked, or nil. Reading clears it.
+        methods.add_method("take_search_pick", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let tab = this.resolve(&mux)?;
+            Ok(tab.take_search_pick().map(|i| i + 1))
         });
         methods.add_method("get_parent", |_, this, _: ()| {
             let mux = get_mux()?;

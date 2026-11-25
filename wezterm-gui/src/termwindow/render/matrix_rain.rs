@@ -54,14 +54,16 @@ const SCRUB_GAP_MS: u64 = 350;
 /// the tab you landed on.
 const SETTLE_MS: u64 = 300;
 
-/// Resolving out of a scroll: the black the rain ran over fades out this
-/// quickly, so the landed tab emerges instead of being drawn onto a blank pane.
-const HOLD_FADE_MS: f32 = 450.0;
+/// Once you stop on a tab, the rain you were scrolling through is wiped away
+/// top to bottom by a front that reveals that tab; this long for the slowest column.
+const RESOLVE_MS: f32 = 1000.0;
 
-/// How opaque the black under a resolving scroll still is `elapsed_ms` in.
-fn hold_fade_alpha(elapsed_ms: f32) -> f32 {
-    let t = (elapsed_ms / HOLD_FADE_MS).clamp(0.0, 1.0);
-    1.0 - t * t * (3.0 - 2.0 * t)
+/// Where a column's reveal front is, `dt_ms` after landing: in rows from the
+/// top, `-1` meaning nothing revealed yet (every row still rain) and `rows - 1`
+/// meaning the whole column revealed. `phase` (0..PHASE_MAX) staggers columns.
+fn resolve_front(dt_ms: f32, phase: f32, rows: usize) -> f32 {
+    let fp = ((dt_ms / RESOLVE_MS - phase) / (1.0 - PHASE_MAX)).clamp(0.0, 1.0);
+    fp * rows as f32 - 1.0
 }
 
 /// Is a switch this long after the previous one (`None`: there was none) part of a scroll?
@@ -229,9 +231,9 @@ pub struct TabSwitchAnim {
     /// While in the future, this is a scroll through tabs: plain rain over the
     /// pane, no tab built. When it passes, the active tab resolves out of the rain.
     hold_until: Option<Instant>,
-    /// This build resolves a scroll: no per-column blanking; a pane-wide black
-    /// fades out instead (`hold_fade_alpha`), so the tab emerges from the rain.
-    from_hold: bool,
+    /// Set once a scroll has stopped: the rain, which has run on one time base
+    /// since the first switch, now resolves into the tab (`cells`) behind a front.
+    landed_at: Option<Instant>,
     pane_id: PaneId,
     cols: usize,
     rows: usize,
@@ -342,7 +344,7 @@ impl crate::TermWindow {
         self.tab_switch_anim = Some(TabSwitchAnim {
             start: Instant::now(),
             hold_until: None,
-            from_hold: false,
+            landed_at: None,
             pane_id: new_pane.pane_id(),
             cols,
             rows,
@@ -367,7 +369,12 @@ impl crate::TermWindow {
         let now = Instant::now();
         let since = self.last_tab_switch_at.map(|t| now.duration_since(t));
         self.last_tab_switch_at = Some(now);
-        if !is_scrub(since) {
+        // A scroll in progress (or still resolving) carries on, whatever the gap.
+        let in_scroll = self
+            .tab_switch_anim
+            .as_ref()
+            .map_or(false, |a| a.hold_until.is_some());
+        if !is_scrub(since) && !in_scroll {
             self.start_matrix_rain(prev_pane, new_pane);
             return;
         }
@@ -376,13 +383,14 @@ impl crate::TermWindow {
             // Already holding: keep the rain flowing, just push the end out.
             Some(a) if a.hold_until.is_some() => {
                 a.hold_until = Some(until);
+                a.landed_at = None; // scrolling again: the rain has no destination
                 a.pane_id = new_pane.pane_id();
             }
             _ => {
                 self.tab_switch_anim = Some(TabSwitchAnim {
                     start: now,
                     hold_until: Some(until),
-                    from_hold: false,
+                    landed_at: None,
                     pane_id: new_pane.pane_id(),
                     cols: 0,
                     rows: 0,
@@ -399,8 +407,12 @@ impl crate::TermWindow {
         }
     }
 
-    /// One frame of the scrub: the pane blacked out under falling rain, two
-    /// streams per column at their own speeds.
+    /// One frame of a scroll through tabs: two rain streams per column over a
+    /// black pane, on the animation's single time base. Before landing nothing is
+    /// revealed; after, each column's front sweeps down, wiping the rain away and
+    /// revealing the landed tab (the glyph at the front slides in, as in the
+    /// normal build). The streams never restart, so the rain is one effect.
+    #[allow(clippy::too_many_arguments)]
     fn paint_rain_hold(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -420,21 +432,71 @@ impl crate::TermWindow {
         let left_off = self.dimensions.pixel_width as f32 / 2.0;
         let top_off = self.dimensions.pixel_height as f32 / 2.0;
         let secs = anim.start.elapsed().as_secs_f32();
+        let landed_ms = anim.landed_at.map(|t| t.elapsed().as_secs_f32() * 1000.0);
         let quantum = (secs * 1000.0 / 60.0) as u32;
+        let config = self.config.clone();
+        let style = self
+            .fonts
+            .match_style(&config, &CellAttributes::default())
+            .clone();
+        let font = self.fonts.default_font()?;
         let matrix_style = Self::matrix_text_style();
         let matrix_font = self.matrix_font()?;
         let metrics = self.render_metrics.clone();
         let gl_state = self.render_state.as_ref().unwrap();
         let mut glyph_cache = gl_state.glyph_cache.borrow_mut();
-
+        let mut shape_budget = 96i32;
         let hide = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
-        self.filled_rectangle(
-            layers,
-            LAYER,
-            euclid::rect(ox, oy, cols as f32 * cell_w, rows as f32 * cell_h),
-            hide,
-        )?;
+
         for c in 0..cols {
+            let phase = (hash3(c as u32, 3, 0) % 1000) as f32 / 1000.0 * PHASE_MAX;
+            let front = landed_ms.map_or(-1.0, |ms| resolve_front(ms, phase, rows));
+            // First row still under rain; rows above it show the landed tab.
+            let first_rain = ((front.floor() as i32) + 1).clamp(0, rows as i32);
+
+            if first_rain < rows as i32 {
+                self.filled_rectangle(
+                    layers,
+                    LAYER,
+                    euclid::rect(
+                        ox + c as f32 * cell_w,
+                        oy + first_rain as f32 * cell_h,
+                        cell_w,
+                        (rows as i32 - first_rain) as f32 * cell_h,
+                    ),
+                    hide,
+                )?;
+            }
+
+            // The tab's own glyph, sliding into the row the front is locking in.
+            if front >= 0.0
+                && first_rain < rows as i32
+                && c < anim.cols
+                && (first_rain as usize) < anim.rows
+            {
+                let cell = anim.cells[first_rain as usize * anim.cols + c].clone();
+                if let Some(info) = self.memo_glyph(&anim.glyphs, &cell, &mut shape_budget) {
+                    self.emit_matrix_glyph(
+                        layers,
+                        &mut glyph_cache,
+                        &info,
+                        &style,
+                        &font,
+                        &metrics,
+                        ox,
+                        oy,
+                        cell_w,
+                        cell_h,
+                        c,
+                        front,
+                        LinearRgba::with_components(0.80, 1.0, 0.85, 1.0),
+                        1.0,
+                        left_off,
+                        top_off,
+                    )?;
+                }
+            }
+
             for stream in 0..2u32 {
                 let trail = 5 + (hash3(c as u32, 11, stream) % 9) as i32;
                 let speed = 9.0 + (hash3(c as u32, 12, stream) % 12) as f32; // rows per second
@@ -443,7 +505,7 @@ impl crate::TermWindow {
                 let head = ((secs * speed + offset) % span) as i32;
                 for j in 0..trail {
                     let row = head - j;
-                    if row < 0 || row >= rows as i32 {
+                    if row < first_rain || row >= rows as i32 {
                         continue;
                     }
                     let idx =
@@ -849,17 +911,33 @@ impl crate::TermWindow {
             None => return Ok(()),
         };
 
+        // A scroll through tabs: one rain on one time base. It runs with no
+        // destination until you stop; then the same rain is wiped away by a
+        // front revealing the tab you landed on.
         if let Some(until) = hold_until {
-            if hold_released(Instant::now(), until) {
-                // Scrolling stopped: resolve out of the rain into the landed tab.
-                self.tab_switch_anim = None;
+            let landed = self.tab_switch_anim.as_ref().and_then(|a| a.landed_at);
+            if landed.is_none() && hold_released(Instant::now(), until) {
                 if let Some(pane) = self.get_active_pane_or_overlay() {
-                    self.start_matrix_rain(None, &pane);
+                    let (cols, rows, cells) = capture_screen(&pane);
                     if let Some(a) = self.tab_switch_anim.as_mut() {
-                        a.from_hold = true;
+                        a.cols = cols;
+                        a.rows = rows;
+                        a.cells = cells;
+                        a.pane_id = pane.pane_id();
+                        a.glyphs = RefCell::new(HashMap::new());
+                        a.landed_at = Some(Instant::now());
                     }
+                } else {
+                    self.tab_switch_anim = None;
+                    return Ok(());
                 }
-                self.update_next_frame_time(Some(Instant::now()));
+            }
+            let landed = self.tab_switch_anim.as_ref().and_then(|a| a.landed_at);
+            if landed.map_or(false, |t| t.elapsed().as_secs_f32() * 1000.0 >= RESOLVE_MS) {
+                self.tab_switch_anim = None;
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
                 return Ok(());
             }
             self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(16)));
@@ -995,20 +1073,6 @@ impl crate::TermWindow {
             }
         };
 
-        // Resolving a scroll: the black the rain ran over stays, fading out, in
-        // place of the per-column blanking below.
-        if anim.from_hold {
-            let a = hold_fade_alpha(elapsed);
-            if a > 0.0 {
-                self.filled_rectangle(
-                    layers,
-                    LAYER,
-                    euclid::rect(ox, oy, cols as f32 * cell_w, rows as f32 * cell_h),
-                    LinearRgba::with_components(0.0, 0.0, 0.0, a),
-                )?;
-            }
-        }
-
         // One unified pass per column. Draw order within a column: black mask →
         // falling old text → building new text, so the incoming build layers
         // over the outgoing text where they meet.
@@ -1021,7 +1085,7 @@ impl crate::TermWindow {
             // Mask the region below the build front (down to the deepest
             // change). Above the front, the locked-in new text shows through.
             let mask_top = (cd.front_row + 1).max(0);
-            if mask_top <= cd.depth && !anim.from_hold {
+            if mask_top <= cd.depth {
                 let y0 = oy + mask_top as f32 * cell_h;
                 let y1 = oy + (cd.depth + 1) as f32 * cell_h;
                 self.filled_rectangle(
@@ -1334,18 +1398,29 @@ mod scrub_test {
     }
 
     #[test]
-    fn the_black_under_a_resolving_scroll_fades_out_smoothly() {
-        assert_eq!(hold_fade_alpha(0.0), 1.0);
-        assert_eq!(hold_fade_alpha(HOLD_FADE_MS), 0.0);
-        assert_eq!(hold_fade_alpha(HOLD_FADE_MS * 3.0), 0.0);
-        let mid = hold_fade_alpha(HOLD_FADE_MS / 2.0);
-        assert!((mid - 0.5).abs() < 1e-6);
-        // Never brightens: each step is no more opaque than the last.
-        let mut prev = 1.0;
-        for ms in (0..=450).step_by(30) {
-            let a = hold_fade_alpha(ms as f32);
-            assert!(a <= prev);
-            prev = a;
+    fn the_front_starts_above_the_pane_and_ends_below_it() {
+        // Nothing revealed at landing (row -1: every row still rain), all of it
+        // revealed once the resolve has run (row `rows - 1`: none masked).
+        assert_eq!(resolve_front(0.0, 0.0, 40), -1.0);
+        assert_eq!(resolve_front(RESOLVE_MS, 0.0, 40), 39.0);
+        assert_eq!(resolve_front(RESOLVE_MS * 2.0, 0.0, 40), 39.0);
+    }
+
+    #[test]
+    fn a_later_phase_lags_but_still_finishes() {
+        let early = resolve_front(RESOLVE_MS * 0.5, 0.0, 40);
+        let late = resolve_front(RESOLVE_MS * 0.5, 0.2, 40);
+        assert!(late < early);
+        assert_eq!(resolve_front(RESOLVE_MS, 0.2, 40), 39.0);
+    }
+
+    #[test]
+    fn the_front_only_ever_moves_down() {
+        let mut prev = f32::MIN;
+        for ms in (0..=1200).step_by(25) {
+            let f = resolve_front(ms as f32, 0.1, 30);
+            assert!(f >= prev);
+            prev = f;
         }
     }
 

@@ -1145,12 +1145,19 @@ impl super::TermWindow {
                     }
                 }
 
-                // A hovered link is the user's target, not the program's.
-                if mouse_reporting
-                    && self.config.click_hyperlinks_when_mouse_grabbed
-                    && self.current_highlight.is_some()
-                {
-                    mouse_reporting = false;
+                // A click on a link is the user's, not the program's. Only the click:
+                // the program keeps a drag that merely crosses a link (its own text
+                // selection).
+                if mouse_reporting && self.config.click_hyperlinks_when_mouse_grabbed {
+                    let (ours, pending) = link_click_takes(
+                        &event_trigger_type,
+                        self.link_click_pending,
+                        self.current_highlight.is_some(),
+                    );
+                    self.link_click_pending = pending;
+                    if ours {
+                        mouse_reporting = false;
+                    }
                 }
 
                 if mouse_reporting {
@@ -1273,5 +1280,92 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Left => TMB::Left,
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
+    }
+}
+
+/// With `click_hyperlinks_when_mouse_grabbed`: does this mouse event belong to
+/// wezterm (a click on a link) instead of the program that grabbed the mouse?
+/// `pending` says a press on a link is still held. Returns (ours, new pending).
+fn link_click_takes(trigger: &MouseEventTrigger, pending: bool, on_link: bool) -> (bool, bool) {
+    match trigger {
+        MouseEventTrigger::Down {
+            streak: 1,
+            button: MouseButton::Left,
+        } if on_link => (true, true),
+        // The program never saw the press, so the rest of the gesture is ours too.
+        MouseEventTrigger::Drag {
+            button: MouseButton::Left,
+            ..
+        } if pending => (true, true),
+        MouseEventTrigger::Up {
+            button: MouseButton::Left,
+            ..
+        } if pending => (true, false),
+        MouseEventTrigger::Up {
+            button: MouseButton::Left,
+            ..
+        } => (false, false),
+        _ => (false, pending),
+    }
+}
+
+#[cfg(test)]
+mod link_click_test {
+    use super::*;
+
+    const LEFT: MouseButton = MouseButton::Left;
+    fn down() -> MouseEventTrigger {
+        MouseEventTrigger::Down {
+            streak: 1,
+            button: LEFT,
+        }
+    }
+    fn drag() -> MouseEventTrigger {
+        MouseEventTrigger::Drag {
+            streak: 1,
+            button: LEFT,
+        }
+    }
+    fn up() -> MouseEventTrigger {
+        MouseEventTrigger::Up {
+            streak: 1,
+            button: LEFT,
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_link_is_ours_press_and_release() {
+        assert_eq!(link_click_takes(&down(), false, true), (true, true));
+        assert_eq!(link_click_takes(&up(), true, true), (true, false));
+    }
+
+    /// The program in the pane is selecting text: a drag that crosses a link,
+    /// or ends on one, is still the program's.
+    #[test]
+    fn a_drag_that_began_off_a_link_stays_with_the_program() {
+        assert_eq!(link_click_takes(&down(), false, false), (false, false));
+        assert_eq!(link_click_takes(&drag(), false, true), (false, false));
+        assert_eq!(link_click_takes(&up(), false, true), (false, false));
+    }
+
+    /// The program never saw the press, so it must not see the rest either.
+    #[test]
+    fn a_drag_that_began_on_a_link_stays_ours_until_release() {
+        assert_eq!(link_click_takes(&drag(), true, false), (true, true));
+        assert_eq!(link_click_takes(&up(), true, false), (true, false));
+    }
+
+    #[test]
+    fn other_buttons_and_multi_clicks_are_left_alone() {
+        let right = MouseEventTrigger::Down {
+            streak: 1,
+            button: MouseButton::Right,
+        };
+        assert_eq!(link_click_takes(&right, false, true), (false, false));
+        let double = MouseEventTrigger::Down {
+            streak: 2,
+            button: LEFT,
+        };
+        assert_eq!(link_click_takes(&double, false, true), (false, false));
     }
 }

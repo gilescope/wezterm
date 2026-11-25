@@ -11,23 +11,53 @@ User facing docs and guide at: https://wezterm.org/
 ## This fork: tab supremacy
 
 This is [gilescope](https://github.com/gilescope)'s fork. It keeps up with
-upstream and adds a tab bar that does more than any browser's:
+upstream and adds a tab bar that does more than any browser's. Everything is
+opt-in through the config; each name below has a page under `docs/config/lua`.
 
-* **Nested tabs**: a side bar of root tabs, each with its own child tabs.
-* **Back and forward** through the tabs you have shown, like a browser's history.
-* **Tab search** over titles, directories and programs, and over pages a tab carries.
-* **A browser in a tab**: the Kitty graphics fixes here (acknowledged transmits,
-  shared memory on macOS, no hashing of streamed frames) let
-  [awrit](https://github.com/gilescope/awrit) draw Chromium into a pane, so a web
-  page is a child tab like any other. The Lua that manages those tabs is not in
-  this repository yet.
-* **Matrix rain** between tabs: the old tab, pictures included, falls away as the
-  new one builds; scrolling through tabs holds the rain until you land, and it
-  waits for a tab that is still loading.
-* **Plain-click links**, even when the program in the pane has grabbed the mouse.
-* **A resume card** when you return to a tab after a while away.
+### The tab bar
 
-Most of it is opt-in through the config; see `docs/config/lua`.
+| Feature                                                | How                                                                          |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| Tab bar down the side                                  | `tab_bar_position = "Left"` or `"Right"`, `tab_bar_width`                    |
+| Nested tabs: root tabs, each with child tabs           | `SpawnChildTab`, `ActivateRootRelative`, `tab:get_parent()` / `set_parent()` |
+| Back and forward through the tabs you have shown       | `show_tab_history_buttons_in_tab_bar`, `ActivateTabHistory`                  |
+| Search tabs by title, directory, program or page       | `show_tab_search_in_tab_bar`, `ShowTabSearch`, `tab:set_search_items()`      |
+| A button for a browser tab                             | `show_browser_button_in_tab_bar`, `browser_button_label`                     |
+| Reorder tabs                                           | `MoveTabRelative`                                                            |
+| See what a tab's program is doing, or that it finished | `pane:get_program_status()`, `pane:has_unseen_command_result()`              |
+
+### Switching tabs
+
+* **Matrix rain** plays between tabs: the old tab falls away, pictures included,
+  as the new one builds, with the occasional film quote decoded into the rain.
+* **Scrolling through tabs** holds the rain with no destination until you stop,
+  then resolves into the tab you landed on.
+* **A tab that is still loading** can ask the rain to wait for its picture (the
+  `wezterm_hold_rain_for_picture` user variable), so the load hides in the effect.
+* **A resume card** can greet you when you return to a tab after a while away:
+  the `tab-activated` event and `window:show_card()`.
+
+### A browser in a tab
+
+The Kitty graphics fixes here let [awrit](https://github.com/gilescope/awrit)
+draw Chromium into a pane on macOS, so a web page is a child tab like any other:
+
+* a transmit naming its image with `i=` is acknowledged;
+* shared-memory frames work on macOS, and are not hashed when large;
+* a shifted key reports Shift under the Kitty keyboard protocol, so `@` arrives as `@`.
+
+Set `enable_kitty_graphics` and `enable_kitty_keyboard`. The Lua that opens,
+unloads and reloads the browser tabs is not in this repository yet.
+
+### Smaller things
+
+* **Plain-click links** even when the program in the pane has grabbed the mouse:
+  `click_hyperlinks_when_mouse_grabbed`.
+* **Cmd-C** reaches a mouse-grabbing program when wezterm has no selection.
+* **Paste** goes into the tab search box while it is open.
+* **Scrollback survives a restart**: `pane:save_scrollback()` and `pane:load_scrollback()`.
+* **Place a window over the pane area** from Lua: `window:get_position()`, and
+  `content_left` / `content_top` in `window:get_dimensions()`.
 
 ## Installation
 

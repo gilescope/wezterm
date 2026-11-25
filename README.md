@@ -40,7 +40,11 @@ opt-in through the config; each name below has a page under `docs/config/lua`.
 ### A browser in a tab
 
 The Kitty graphics fixes here let [awrit](https://github.com/gilescope/awrit)
-draw Chromium into a pane on macOS, so a web page is a child tab like any other:
+draw Chromium into a pane on macOS, so a web page is a child tab like any other.
+Use awrit at
+[`300a30b`](https://github.com/gilescope/awrit/tree/300a30bcd58dec655280ef8adde8f53f4b4f1298)
+or later, which has the wezterm side of this (mouse scale, popups in the pane, a
+top bar):
 
 * a transmit naming its image with `i=` is acknowledged;
 * shared-memory frames work on macOS, and are not hashed when large;

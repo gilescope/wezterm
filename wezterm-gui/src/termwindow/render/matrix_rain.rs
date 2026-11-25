@@ -47,6 +47,23 @@ const ZOOM_SETTLE: f32 = 0.35;
 /// back to the user's font if it isn't installed.
 const MATRIX_FONT_FAMILY: &str = "Matrix Code NFI";
 
+/// A switch within this long of the previous one is part of a scroll through
+/// tabs: show plain rain instead of building each tab for a split second.
+const SCRUB_GAP_MS: u64 = 350;
+/// The rain holds until no switch has come for this long, then resolves into
+/// the tab you landed on.
+const SETTLE_MS: u64 = 300;
+
+/// Is a switch this long after the previous one (`None`: there was none) part of a scroll?
+fn is_scrub(since_last: Option<Duration>) -> bool {
+    since_last.map_or(false, |d| d < Duration::from_millis(SCRUB_GAP_MS))
+}
+
+/// Has the hold ending at `until` run out at `now`?
+fn hold_released(now: Instant, until: Instant) -> bool {
+    now >= until
+}
+
 /// Chance that a tab switch decodes an easter-egg figure into the rain.
 const EGG_PROBABILITY: f32 = 0.5;
 /// Centre of the egg within the transition. The rain NEVER pauses — the figure
@@ -199,6 +216,9 @@ impl ResumeCardAnim {
 /// Captured state for one tab-switch transition.
 pub struct TabSwitchAnim {
     start: Instant,
+    /// While in the future, this is a scroll through tabs: plain rain over the
+    /// pane, no tab built. When it passes, the active tab resolves out of the rain.
+    hold_until: Option<Instant>,
     pane_id: PaneId,
     cols: usize,
     rows: usize,
@@ -308,6 +328,7 @@ impl crate::TermWindow {
 
         self.tab_switch_anim = Some(TabSwitchAnim {
             start: Instant::now(),
+            hold_until: None,
             pane_id: new_pane.pane_id(),
             cols,
             rows,
@@ -322,6 +343,125 @@ impl crate::TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+    }
+
+    /// A tab switch arrived: a first one builds the new tab as usual; one in
+    /// quick succession (scrolling through tabs) holds plain rain instead,
+    /// renewed by each further switch, and resolves into whichever tab you
+    /// stop on.
+    pub fn on_tab_switched(&mut self, prev_pane: Option<Arc<dyn Pane>>, new_pane: &Arc<dyn Pane>) {
+        let now = Instant::now();
+        let since = self.last_tab_switch_at.map(|t| now.duration_since(t));
+        self.last_tab_switch_at = Some(now);
+        if !is_scrub(since) {
+            self.start_matrix_rain(prev_pane, new_pane);
+            return;
+        }
+        let until = now + Duration::from_millis(SETTLE_MS);
+        match self.tab_switch_anim.as_mut() {
+            // Already holding: keep the rain flowing, just push the end out.
+            Some(a) if a.hold_until.is_some() => {
+                a.hold_until = Some(until);
+                a.pane_id = new_pane.pane_id();
+            }
+            _ => {
+                self.tab_switch_anim = Some(TabSwitchAnim {
+                    start: now,
+                    hold_until: Some(until),
+                    pane_id: new_pane.pane_id(),
+                    cols: 0,
+                    rows: 0,
+                    cells: Vec::new(),
+                    old_cells: Vec::new(),
+                    depth: Vec::new(),
+                    glyphs: RefCell::new(HashMap::new()),
+                    egg: None,
+                });
+            }
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// One frame of the scrub: the pane blacked out under falling rain, two
+    /// streams per column at their own speeds.
+    fn paint_rain_hold(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        anim: &TabSwitchAnim,
+        palette: &[GlyphInfo],
+        pane_left: usize,
+        pane_top: usize,
+        cols: usize,
+        rows: usize,
+    ) -> anyhow::Result<()> {
+        if cols == 0 || rows == 0 || palette.is_empty() {
+            return Ok(());
+        }
+        let cell_w = self.render_metrics.cell_size.width as f32;
+        let cell_h = self.render_metrics.cell_size.height as f32;
+        let (ox, oy) = self.matrix_pane_origin(pane_left, pane_top);
+        let left_off = self.dimensions.pixel_width as f32 / 2.0;
+        let top_off = self.dimensions.pixel_height as f32 / 2.0;
+        let secs = anim.start.elapsed().as_secs_f32();
+        let quantum = (secs * 1000.0 / 60.0) as u32;
+        let matrix_style = Self::matrix_text_style();
+        let matrix_font = self.matrix_font()?;
+        let metrics = self.render_metrics.clone();
+        let gl_state = self.render_state.as_ref().unwrap();
+        let mut glyph_cache = gl_state.glyph_cache.borrow_mut();
+
+        let hide = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
+        self.filled_rectangle(
+            layers,
+            LAYER,
+            euclid::rect(ox, oy, cols as f32 * cell_w, rows as f32 * cell_h),
+            hide,
+        )?;
+        for c in 0..cols {
+            for stream in 0..2u32 {
+                let trail = 5 + (hash3(c as u32, 11, stream) % 9) as i32;
+                let speed = 9.0 + (hash3(c as u32, 12, stream) % 12) as f32; // rows per second
+                let span = (rows as i32 + trail) as f32;
+                let offset = (hash3(c as u32, 13, stream) % 1000) as f32 / 1000.0 * span;
+                let head = ((secs * speed + offset) % span) as i32;
+                for j in 0..trail {
+                    let row = head - j;
+                    if row < 0 || row >= rows as i32 {
+                        continue;
+                    }
+                    let idx =
+                        hash3(c as u32, row as u32, quantum + stream) as usize % palette.len();
+                    let b = 1.0 - j as f32 / trail as f32;
+                    let color = if j == 0 {
+                        LinearRgba::with_components(0.75, 1.0, 0.80, 1.0)
+                    } else {
+                        let g = 0.25 + 0.75 * b;
+                        LinearRgba::with_components(0.0, g, 0.10 * g, 0.35 + 0.65 * b)
+                    };
+                    self.emit_matrix_glyph(
+                        layers,
+                        &mut glyph_cache,
+                        &palette[idx],
+                        &matrix_style,
+                        &matrix_font,
+                        &metrics,
+                        ox,
+                        oy,
+                        cell_w,
+                        cell_h,
+                        c,
+                        row as f32,
+                        color,
+                        1.0,
+                        left_off,
+                        top_off,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Look up a real grapheme's glyph from the per-animation memo, shaping it
@@ -689,10 +829,34 @@ impl crate::TermWindow {
         pane_cols: usize,
         pane_rows: usize,
     ) -> anyhow::Result<()> {
-        let start = match &self.tab_switch_anim {
-            Some(anim) => anim.start,
+        let (start, hold_until) = match &self.tab_switch_anim {
+            Some(anim) => (anim.start, anim.hold_until),
             None => return Ok(()),
         };
+
+        if let Some(until) = hold_until {
+            if hold_released(Instant::now(), until) {
+                // Scrolling stopped: resolve out of the rain into the landed tab.
+                self.tab_switch_anim = None;
+                if let Some(pane) = self.get_active_pane_or_overlay() {
+                    self.start_matrix_rain(None, &pane);
+                }
+                self.update_next_frame_time(Some(Instant::now()));
+                return Ok(());
+            }
+            self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(16)));
+            let anim = self.tab_switch_anim.take().unwrap();
+            let palette = match self.matrix_rain_palette.take() {
+                Some(p) => p,
+                None => self.shape_matrix_palette().unwrap_or_default(),
+            };
+            let result = self.paint_rain_hold(
+                layers, &anim, &palette, pane_left, pane_top, pane_cols, pane_rows,
+            );
+            self.matrix_rain_palette = Some(palette);
+            self.tab_switch_anim = Some(anim);
+            return result;
+        }
 
         let elapsed = start.elapsed().as_secs_f32() * 1000.0;
         if elapsed >= DURATION_MS {
@@ -1113,5 +1277,36 @@ impl crate::TermWindow {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scrub_test {
+    use super::*;
+
+    #[test]
+    fn a_first_switch_is_not_a_scrub() {
+        assert!(!is_scrub(None));
+    }
+
+    #[test]
+    fn a_quick_second_switch_is_a_scrub() {
+        assert!(is_scrub(Some(Duration::from_millis(120))));
+        assert!(is_scrub(Some(Duration::from_millis(SCRUB_GAP_MS - 1))));
+    }
+
+    #[test]
+    fn a_pause_ends_the_scrub() {
+        assert!(!is_scrub(Some(Duration::from_millis(SCRUB_GAP_MS))));
+        assert!(!is_scrub(Some(Duration::from_secs(5))));
+    }
+
+    #[test]
+    fn the_hold_releases_once_the_settle_time_has_passed() {
+        let t0 = Instant::now();
+        let until = t0 + Duration::from_millis(SETTLE_MS);
+        assert!(!hold_released(t0, until));
+        assert!(hold_released(until, until));
+        assert!(hold_released(until + Duration::from_millis(1), until));
     }
 }

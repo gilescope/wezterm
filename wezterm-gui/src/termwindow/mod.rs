@@ -441,6 +441,8 @@ pub struct TermWindow {
     tab_bar_width_override: Option<f32>,
     /// Active matrix-rain tab-switch transition, if any.
     tab_switch_anim: Option<crate::termwindow::render::matrix_rain::TabSwitchAnim>,
+    /// When the tab last changed, to tell a scroll through tabs from one switch.
+    last_tab_switch_at: Option<Instant>,
     /// Resume card shown over the active pane; see `matrix_rain.rs`.
     resume_card: Option<crate::termwindow::render::matrix_rain::ResumeCardAnim>,
     /// Lazily-shaped katakana/digit glyph palette for the matrix rain.
@@ -794,6 +796,7 @@ impl TermWindow {
             tab_bar_scroll_offset: std::cell::Cell::new(0.),
             tab_bar_width_override: None,
             tab_switch_anim: None,
+            last_tab_switch_at: None,
             resume_card: None,
             matrix_rain_palette: None,
             right_status: String::new(),
@@ -2483,7 +2486,7 @@ impl TermWindow {
             if changed {
                 // A card belongs to the tab it was shown on.
                 self.clear_resume_card();
-                self.start_matrix_rain(prev_pane, &pane);
+                self.on_tab_switched(prev_pane, &pane);
                 let away = {
                     let mux = Mux::get();
                     let window = mux.get_window(self.mux_window_id);

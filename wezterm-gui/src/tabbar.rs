@@ -30,6 +30,11 @@ pub struct TabBarState {
 /// Title of the tab a script uses to host a browser; the Browser button lights up on it.
 pub const BROWSER_TAB_TITLE: &str = "Browser";
 
+/// The button's text, padded like the other tab-bar items.
+pub fn browser_button_text(label: &str) -> String {
+    format!(" {label} ")
+}
+
 /// The Browser button is lit while the active tab is the browser's tab.
 fn browser_selected(tab_info: &[TabInformation]) -> bool {
     tab_info
@@ -852,7 +857,10 @@ impl TabBarState {
 
         if config.show_browser_button_in_tab_bar {
             let selected = browser_selected(tab_info);
-            let button = parse_status_text(" Browser ", black_cell.attrs().clone());
+            let button = parse_status_text(
+                &browser_button_text(&config.browser_button_label),
+                black_cell.attrs().clone(),
+            );
             let width = button.len();
             line.append_line(button.clone(), SEQ_ZERO);
             items.push(TabEntry {
@@ -1248,6 +1256,13 @@ mod tests {
             HistoryNav::default(),
             reuse,
         )
+    }
+
+    #[test]
+    fn the_browser_button_label_defaults_to_browser_and_can_be_changed() {
+        std::assert_eq!(config::Config::default().browser_button_label, "Browser");
+        std::assert_eq!(browser_button_text("Browser"), " Browser ");
+        std::assert_eq!(browser_button_text("+"), " + ");
     }
 
     #[test]

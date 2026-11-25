@@ -659,32 +659,35 @@ impl crate::TermWindow {
                         new_tab.fg_color.to_linear().mul_alpha(0.7),
                     )
                 };
-                Element::new(font, ElementContent::Text("Browser".to_string()))
-                    .vertical_align(VerticalAlign::Middle)
-                    .item_type(UIItemType::TabBar(item.item.clone()))
-                    .margin(BoxDimension {
-                        left: Dimension::Cells(0.5),
-                        right: Dimension::Cells(0.),
-                        top: Dimension::Cells(0.2),
-                        bottom: Dimension::Cells(0.),
-                    })
-                    .padding(BoxDimension {
-                        left: Dimension::Cells(0.75),
-                        right: Dimension::Cells(0.75),
-                        top: Dimension::Cells(0.),
-                        bottom: Dimension::Cells(0.),
-                    })
-                    .border(BoxDimension::new(Dimension::Pixels(1.)))
-                    .colors(ElementColors {
-                        border: BorderColor::new(fg.mul_alpha(0.5)),
-                        bg: bg.into(),
-                        text: fg.into(),
-                    })
-                    .hover_colors(Some(ElementColors {
-                        border: BorderColor::new(new_tab_hover.fg_color.to_linear()),
-                        bg: new_tab_hover.bg_color.to_linear().into(),
-                        text: new_tab_hover.fg_color.to_linear().into(),
-                    }))
+                Element::new(
+                    font,
+                    ElementContent::Text(self.config.browser_button_label.clone()),
+                )
+                .vertical_align(VerticalAlign::Middle)
+                .item_type(UIItemType::TabBar(item.item.clone()))
+                .margin(BoxDimension {
+                    left: Dimension::Cells(0.5),
+                    right: Dimension::Cells(0.),
+                    top: Dimension::Cells(0.2),
+                    bottom: Dimension::Cells(0.),
+                })
+                .padding(BoxDimension {
+                    left: Dimension::Cells(0.75),
+                    right: Dimension::Cells(0.75),
+                    top: Dimension::Cells(0.),
+                    bottom: Dimension::Cells(0.),
+                })
+                .border(BoxDimension::new(Dimension::Pixels(1.)))
+                .colors(ElementColors {
+                    border: BorderColor::new(fg.mul_alpha(0.5)),
+                    bg: bg.into(),
+                    text: fg.into(),
+                })
+                .hover_colors(Some(ElementColors {
+                    border: BorderColor::new(new_tab_hover.fg_color.to_linear()),
+                    bg: new_tab_hover.bg_color.to_linear().into(),
+                    text: new_tab_hover.fg_color.to_linear().into(),
+                }))
             }
             TabBarItem::TabSearch => {
                 Element::new(font, ElementContent::Text("⌕ search".to_string()))

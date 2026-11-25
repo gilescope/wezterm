@@ -197,7 +197,6 @@ fn kitty_transmit_without_an_id_is_not_acknowledged() {
 }
 
 /// Standard base64 (RFC 4648, with padding) of `bytes`; the test crate has no base64 dependency.
-#[cfg(target_os = "macos")]
 fn base64(bytes: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -256,4 +255,32 @@ fn kitty_shared_memory_frame_ignores_the_padding_macos_adds() {
     std::assert_eq!(answer_to(&seq), "\x1b_Gi=9;OK\x1b\\");
     drop(child.stdin.take());
     child.wait().unwrap();
+}
+
+/// The content hash of the one image a terminal holds after being fed an RGBA
+/// transmit of `side` x `side` zero pixels.
+fn hash_after_transmitting(side: usize) -> [u8; 32] {
+    let mut term = TestTerm::new(3, 10, 0);
+    let pixels = vec![0u8; side * side * 4];
+    let seq = format!(
+        "\x1b_Ga=T,t=d,f=32,s={side},v={side},i=1;{}\x1b\\",
+        base64(&pixels)
+    );
+    term.advance_bytes(seq.as_bytes());
+    first_image(&term).data().compute_hash()
+}
+
+/// Hashing every frame costs more than it saves for programs that stream big
+/// frames (a browser in a pane): each one is new, so a content id never matches.
+/// Frames of 1 MiB or more therefore get a cheap unique id instead.
+#[test]
+fn kitty_streamed_frames_are_not_content_hashed() {
+    // 512 x 512 x 4 bytes = 1 MiB: identical pixels, yet distinct ids.
+    std::assert_ne!(hash_after_transmitting(512), hash_after_transmitting(512));
+}
+
+/// Small images keep the content hash, so the same picture shares one texture.
+#[test]
+fn kitty_small_images_are_still_content_hashed() {
+    std::assert_eq!(hash_after_transmitting(64), hash_after_transmitting(64));
 }

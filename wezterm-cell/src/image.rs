@@ -316,6 +316,39 @@ impl ImageDataType {
         }
     }
 
+    /// Frames at least this big are not content-hashed (see `new_single_frame_streamed`).
+    pub const STREAMED_FRAME_BYTES: usize = 1 << 20;
+
+    /// Like `new_single_frame`, but identifies the image by a cheap unique id
+    /// instead of a SHA-256 of its pixels. For programs that stream big frames
+    /// (a browser drawing into a pane): every frame is new, so a content id
+    /// never matches an earlier one and hashing megabytes per frame is pure cost.
+    /// The price is that identical pixels sent twice are not shared. Whoever
+    /// edits the pixels later must refresh the hash with `hash_bytes`, as for
+    /// any other image.
+    pub fn new_single_frame_streamed(width: u32, height: u32, data: Vec<u8>) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+        // Marks it as an id, not a digest; a real SHA-256 matching this is as likely as any collision.
+        hash[8..].fill(0xA5);
+        assert_eq!(
+            width * height * 4,
+            data.len() as u32,
+            "invalid dimensions {}x{} for pixel data of length {}",
+            width,
+            height,
+            data.len()
+        );
+        Self::Rgba8 {
+            width,
+            height,
+            data,
+            hash,
+        }
+    }
+
     /// Black pixels
     pub fn placeholder() -> Self {
         let mut data = vec![];

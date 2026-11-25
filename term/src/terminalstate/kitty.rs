@@ -828,7 +828,11 @@ impl TerminalState {
                     width * height * 4
                 );
 
-                ImageDataType::new_single_frame(width, height, data)
+                if data.len() >= ImageDataType::STREAMED_FRAME_BYTES {
+                    ImageDataType::new_single_frame_streamed(width, height, data)
+                } else {
+                    ImageDataType::new_single_frame(width, height, data)
+                }
             }
             Some(KittyImageFormat::Png) => {
                 let info = dimensions(&data)?;

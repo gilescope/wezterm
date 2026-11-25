@@ -54,6 +54,16 @@ const SCRUB_GAP_MS: u64 = 350;
 /// the tab you landed on.
 const SETTLE_MS: u64 = 300;
 
+/// Resolving out of a scroll: the black the rain ran over fades out this
+/// quickly, so the landed tab emerges instead of being drawn onto a blank pane.
+const HOLD_FADE_MS: f32 = 450.0;
+
+/// How opaque the black under a resolving scroll still is `elapsed_ms` in.
+fn hold_fade_alpha(elapsed_ms: f32) -> f32 {
+    let t = (elapsed_ms / HOLD_FADE_MS).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
 /// Is a switch this long after the previous one (`None`: there was none) part of a scroll?
 fn is_scrub(since_last: Option<Duration>) -> bool {
     since_last.map_or(false, |d| d < Duration::from_millis(SCRUB_GAP_MS))
@@ -219,6 +229,9 @@ pub struct TabSwitchAnim {
     /// While in the future, this is a scroll through tabs: plain rain over the
     /// pane, no tab built. When it passes, the active tab resolves out of the rain.
     hold_until: Option<Instant>,
+    /// This build resolves a scroll: no per-column blanking; a pane-wide black
+    /// fades out instead (`hold_fade_alpha`), so the tab emerges from the rain.
+    from_hold: bool,
     pane_id: PaneId,
     cols: usize,
     rows: usize,
@@ -329,6 +342,7 @@ impl crate::TermWindow {
         self.tab_switch_anim = Some(TabSwitchAnim {
             start: Instant::now(),
             hold_until: None,
+            from_hold: false,
             pane_id: new_pane.pane_id(),
             cols,
             rows,
@@ -368,6 +382,7 @@ impl crate::TermWindow {
                 self.tab_switch_anim = Some(TabSwitchAnim {
                     start: now,
                     hold_until: Some(until),
+                    from_hold: false,
                     pane_id: new_pane.pane_id(),
                     cols: 0,
                     rows: 0,
@@ -840,6 +855,9 @@ impl crate::TermWindow {
                 self.tab_switch_anim = None;
                 if let Some(pane) = self.get_active_pane_or_overlay() {
                     self.start_matrix_rain(None, &pane);
+                    if let Some(a) = self.tab_switch_anim.as_mut() {
+                        a.from_hold = true;
+                    }
                 }
                 self.update_next_frame_time(Some(Instant::now()));
                 return Ok(());
@@ -977,6 +995,20 @@ impl crate::TermWindow {
             }
         };
 
+        // Resolving a scroll: the black the rain ran over stays, fading out, in
+        // place of the per-column blanking below.
+        if anim.from_hold {
+            let a = hold_fade_alpha(elapsed);
+            if a > 0.0 {
+                self.filled_rectangle(
+                    layers,
+                    LAYER,
+                    euclid::rect(ox, oy, cols as f32 * cell_w, rows as f32 * cell_h),
+                    LinearRgba::with_components(0.0, 0.0, 0.0, a),
+                )?;
+            }
+        }
+
         // One unified pass per column. Draw order within a column: black mask →
         // falling old text → building new text, so the incoming build layers
         // over the outgoing text where they meet.
@@ -989,7 +1021,7 @@ impl crate::TermWindow {
             // Mask the region below the build front (down to the deepest
             // change). Above the front, the locked-in new text shows through.
             let mask_top = (cd.front_row + 1).max(0);
-            if mask_top <= cd.depth {
+            if mask_top <= cd.depth && !anim.from_hold {
                 let y0 = oy + mask_top as f32 * cell_h;
                 let y1 = oy + (cd.depth + 1) as f32 * cell_h;
                 self.filled_rectangle(
@@ -1299,6 +1331,22 @@ mod scrub_test {
     fn a_pause_ends_the_scrub() {
         assert!(!is_scrub(Some(Duration::from_millis(SCRUB_GAP_MS))));
         assert!(!is_scrub(Some(Duration::from_secs(5))));
+    }
+
+    #[test]
+    fn the_black_under_a_resolving_scroll_fades_out_smoothly() {
+        assert_eq!(hold_fade_alpha(0.0), 1.0);
+        assert_eq!(hold_fade_alpha(HOLD_FADE_MS), 0.0);
+        assert_eq!(hold_fade_alpha(HOLD_FADE_MS * 3.0), 0.0);
+        let mid = hold_fade_alpha(HOLD_FADE_MS / 2.0);
+        assert!((mid - 0.5).abs() < 1e-6);
+        // Never brightens: each step is no more opaque than the last.
+        let mut prev = 1.0;
+        for ms in (0..=450).step_by(30) {
+            let a = hold_fade_alpha(ms as f32);
+            assert!(a <= prev);
+            prev = a;
+        }
     }
 
     #[test]

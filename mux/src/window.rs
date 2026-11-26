@@ -307,13 +307,22 @@ impl Window {
         }
     }
 
-    /// Remove tab at given index, switching to previous active tab if needed.
-    fn do_remove_tab_idx(&mut self, idx: usize, active: Option<Arc<Tab>>) -> Arc<Tab> {
-        if let (Some(active), Some(removing)) = (&active, self.tabs.get(idx)) {
-            if active.tab_id() == removing.tab_id()
-                && config::configuration().switch_to_last_active_tab_when_closing_tab
-            {
-                // If we are removing active tab, switch back to previously active tab
+    /// Remove tab at given index. Closing the active tab goes back to the most
+    /// recent tab in the history that still exists; with none, to the last
+    /// active tab if configured, else to the neighbour.
+    fn do_remove_tab_idx(&mut self, idx: usize, mut active: Option<Arc<Tab>>) -> Arc<Tab> {
+        let closing_active = match (&active, self.tabs.get(idx)) {
+            (Some(active), Some(removing)) => active.tab_id() == removing.tab_id(),
+            _ => false,
+        };
+        if closing_active {
+            if let Some((pos, back)) = self.history_target(-1) {
+                self.sync_history_to_active();
+                self.history_pos = pos;
+                self.active_since = Instant::now();
+                // By tab, not index: the removal below shifts indices.
+                active = self.tabs.get(back).map(Arc::clone);
+            } else if config::configuration().switch_to_last_active_tab_when_closing_tab {
                 if let Some(last_active) = self.get_last_active_tab_idx() {
                     self.set_active_tab_idx_without_saving(last_active);
                 }
@@ -823,23 +832,61 @@ mod history_test {
         assert!(!w.can_step_history(1));
     }
 
+    /// Closing the tab you are on returns to the one you were on before it,
+    /// not to whichever tab sits beside it in the bar.
+    #[test]
+    fn closing_the_active_tab_goes_back_in_history() {
+        let mut w = window_with(4);
+        let ids: Vec<TabId> = w.iter_tabs().map(|t| t.tab_id()).collect();
+        w.remember_and_set_active_tab_idx(3);
+        w.remember_and_set_active_tab_idx(1);
+        w.remove_tab_idx(1);
+        assert_eq!(w.get_active_tab().map(|t| t.tab_id()), Some(ids[3]));
+        // The walk carries on from there.
+        assert!(!w.can_step_history(1));
+        assert_eq!(w.history_step(-1), Some(0));
+    }
+
+    /// The tab before it may be closed already: go back to the most recent
+    /// one that still exists.
+    #[test]
+    fn closing_the_active_tab_skips_closed_history() {
+        let mut w = window_with(5);
+        let ids: Vec<TabId> = w.iter_tabs().map(|t| t.tab_id()).collect();
+        w.remember_and_set_active_tab_idx(1);
+        w.remember_and_set_active_tab_idx(4);
+        w.remember_and_set_active_tab_idx(2);
+        w.remove_tab_id(ids[4]);
+        assert_eq!(w.get_active_tab().map(|t| t.tab_id()), Some(ids[2]));
+        w.remove_tab_id(ids[2]);
+        assert_eq!(w.get_active_tab().map(|t| t.tab_id()), Some(ids[1]));
+    }
+
+    /// With nowhere to go back to, the neighbour takes over as before.
+    #[test]
+    fn closing_the_active_tab_without_history_takes_the_neighbour() {
+        let mut w = window_with(3);
+        let ids: Vec<TabId> = w.iter_tabs().map(|t| t.tab_id()).collect();
+        w.remove_tab_idx(0);
+        assert_eq!(w.get_active_tab().map(|t| t.tab_id()), Some(ids[1]));
+    }
+
     /// Re-activating the current tab, or a tab the window switched to on
-    /// its own (closing the active one), does not leave the walk stranded.
+    /// its own (closing the active one with nothing to go back to), does
+    /// not leave the walk stranded.
     #[test]
     fn history_tracks_where_the_window_actually_is() {
         let mut w = window_with(3);
-        w.remember_and_set_active_tab_idx(1);
-        w.remember_and_set_active_tab_idx(1);
-        w.remove_tab_idx(1);
-        // The window moved to the next tab by itself (not a user step), so
-        // the history still ends at the closed tab: back goes to tab 0, and
-        // a fresh activation first records the tab we are really leaving.
-        assert_eq!(w.get_active_tab_idx(), 1);
-        assert_eq!(w.history_step(-1), Some(0));
-        assert_eq!(w.history_step(1), Some(1));
         w.remember_and_set_active_tab_idx(0);
-        assert_eq!(w.history_step(-1), Some(1));
+        w.remove_tab_idx(0);
+        // The window moved to the neighbour by itself (not a user step):
+        // there is nothing live to go back to, and a fresh activation
+        // first records the tab we are really leaving.
+        assert_eq!(w.get_active_tab_idx(), 0);
+        assert_eq!(w.history_step(-1), None);
+        w.remember_and_set_active_tab_idx(1);
         assert_eq!(w.history_step(-1), Some(0));
         assert_eq!(w.history_step(-1), None);
+        assert_eq!(w.history_step(1), Some(1));
     }
 }

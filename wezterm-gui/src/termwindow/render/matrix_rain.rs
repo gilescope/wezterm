@@ -241,6 +241,15 @@ impl ResumeCardAnim {
     }
 }
 
+/// A link click that may be about to open a tab: where it was, and on what.
+pub struct LinkClick {
+    pub at: Instant,
+    /// Pane-relative column.
+    pub col: usize,
+    pub tab_id: mux::tab::TabId,
+    pub pane: Arc<dyn Pane>,
+}
+
 /// Captured state for one tab-switch transition.
 pub struct TabSwitchAnim {
     start: Instant,
@@ -270,6 +279,39 @@ pub struct TabSwitchAnim {
     /// Easter-egg film quote to decode mid-transition, if this switch rolled
     /// one. It plays within the normal duration; the rain never pauses.
     egg: Option<Egg>,
+    /// The column of the link click that caused this switch: the rain starts
+    /// there and spreads outwards.
+    origin_col: Option<usize>,
+}
+
+/// Spread of column start times when the rain starts from a clicked column:
+/// wider than `PHASE_MAX`, so the wave is seen crossing the pane.
+const ORIGIN_PHASE_MAX: f32 = 0.45;
+
+/// A link click starts the rain of a tab switch only if the switch follows
+/// this soon: the click opened that tab.
+const LINK_RAIN_MS: u64 = 3000;
+
+pub fn click_is_fresh(at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(at) < Duration::from_millis(LINK_RAIN_MS)
+}
+
+/// When column `c` starts, as a share of the transition, and the largest such
+/// share. Scattered by default; from a clicked column, later the further away
+/// (with a little scatter left in, so the wave front is not a ruled line).
+fn column_phase(c: usize, cols: usize, origin: Option<usize>) -> (f32, f32) {
+    let scatter = (hash3(c as u32, 3, 0) % 1000) as f32 / 1000.0;
+    let Some(origin) = origin else {
+        return (scatter * PHASE_MAX, PHASE_MAX);
+    };
+    let last = cols.saturating_sub(1);
+    let origin = origin.min(last);
+    let furthest = origin.max(last - origin).max(1);
+    let share = (c.abs_diff(origin) as f32 / furthest as f32).min(1.0);
+    (
+        ORIGIN_PHASE_MAX * share * (0.85 + 0.15 * scatter),
+        ORIGIN_PHASE_MAX,
+    )
 }
 
 /// Cheap deterministic 3-input hash (FNV-1a flavoured). Used to give each
@@ -392,6 +434,7 @@ impl crate::TermWindow {
         &mut self,
         prev_pane: Option<Arc<dyn Pane>>,
         new_pane: &Arc<dyn Pane>,
+        origin_col: Option<usize>,
     ) {
         let (cols, rows, cells) = capture_screen(new_pane);
         if cols == 0 || rows == 0 {
@@ -452,6 +495,7 @@ impl crate::TermWindow {
             // we never pay for the whole screen up front (which could stall).
             glyphs: RefCell::new(HashMap::new()),
             egg,
+            origin_col,
         });
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -466,6 +510,12 @@ impl crate::TermWindow {
         let now = Instant::now();
         let since = self.last_tab_switch_at.map(|t| now.duration_since(t));
         self.last_tab_switch_at = Some(now);
+        // Used up by this switch, whichever way it is drawn.
+        let origin_col = self
+            .link_click
+            .take()
+            .filter(|click| click_is_fresh(click.at, now))
+            .map(|click| click.col);
         // A scroll in progress (or still resolving) carries on, whatever the gap.
         let in_scroll = self
             .tab_switch_anim
@@ -476,7 +526,7 @@ impl crate::TermWindow {
             .get(HOLD_RAIN_VAR)
             .map_or(false, |v| !v.is_empty());
         if !is_scrub(since) && !in_scroll && !wait_picture {
-            self.start_matrix_rain(prev_pane, new_pane);
+            self.start_matrix_rain(prev_pane, new_pane, origin_col);
             return;
         }
         let wait_ms = if wait_picture {
@@ -508,6 +558,7 @@ impl crate::TermWindow {
                     depth: Vec::new(),
                     glyphs: RefCell::new(HashMap::new()),
                     egg: None,
+                    origin_col: None,
                 });
             }
         }
@@ -1222,8 +1273,8 @@ impl crate::TermWindow {
             let matrix = MATRIX_MIN + (hash3(c as u32, 1, 0) % span) as i32;
             let gap = 1 + (hash3(c as u32, 2, 0) % 2) as i32; // new char ↔ stream
             let bridge = bridge_for(c); // stream ↔ falling old text
-            let phase = (hash3(c as u32, 3, 0) % 1000) as f32 / 1000.0 * PHASE_MAX;
-            let fp = ((p - phase) / (1.0 - PHASE_MAX)).clamp(0.0, 1.0);
+            let (phase, phase_max) = column_phase(c, cols, anim.origin_col);
+            let fp = ((p - phase) / (1.0 - phase_max)).clamp(0.0, 1.0);
             let fp = fp * fp * (3.0 - 2.0 * fp); // smoothstep
             let total_lead = (gap + matrix + bridge) as f32;
             // Both finish at fp == 1: old fully off the bottom, all rows built.
@@ -1618,6 +1669,55 @@ mod scrub_test {
         let until = t0 + Duration::from_millis(SETTLE_MS);
         assert!(!hold_over(t0, until, false, true));
         assert!(hold_over(until, until, false, true));
+    }
+
+    #[test]
+    fn without_an_origin_columns_start_at_scattered_times() {
+        for c in 0..200 {
+            let (phase, max) = column_phase(c, 200, None);
+            assert_eq!(max, PHASE_MAX);
+            assert!((0.0..=PHASE_MAX).contains(&phase), "column {c}: {phase}");
+        }
+    }
+
+    #[test]
+    fn the_rain_starts_at_the_clicked_column_and_spreads_outwards() {
+        let at = |c| column_phase(c, 100, Some(30)).0;
+        assert_eq!(at(30), 0.0);
+        // Further from the click starts later, on both sides.
+        assert!(at(30) < at(45) && at(45) < at(70) && at(70) < at(99));
+        assert!(at(30) < at(20) && at(20) < at(0));
+        // Equal distances start at about the same time.
+        assert!((at(20) - at(40)).abs() < 0.2 * ORIGIN_PHASE_MAX);
+    }
+
+    #[test]
+    fn every_column_still_finishes_when_spreading_from_a_click() {
+        for origin in [0, 50, 99, 5000] {
+            for c in 0..100 {
+                let (phase, max) = column_phase(c, 100, Some(origin));
+                assert_eq!(max, ORIGIN_PHASE_MAX);
+                assert!((0.0..=max).contains(&phase), "{origin} {c}: {phase}");
+            }
+        }
+        // A click on the last column: the far edge is the last to start.
+        assert!(column_phase(0, 100, Some(99)).0 > 0.8 * ORIGIN_PHASE_MAX);
+        // One column cannot spread anywhere.
+        assert_eq!(column_phase(0, 1, Some(0)).0, 0.0);
+    }
+
+    #[test]
+    fn a_link_click_only_colours_the_switch_that_follows_it() {
+        let now = Instant::now();
+        assert!(click_is_fresh(now, now));
+        assert!(click_is_fresh(
+            now,
+            now + Duration::from_millis(LINK_RAIN_MS - 1)
+        ));
+        assert!(!click_is_fresh(
+            now,
+            now + Duration::from_millis(LINK_RAIN_MS + 1)
+        ));
     }
 
     #[test]

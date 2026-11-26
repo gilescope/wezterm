@@ -10,5 +10,9 @@ release is sent to the program. When `false` (the default) you must hold
 [bypass_mouse_reporting_modifiers](bypass_mouse_reporting_modifiers.md)
 (`SHIFT` by default) to click the link.
 
+Only a click that starts on the link is taken. A drag that starts elsewhere and
+crosses or ends on a link still goes to the program, so its own text selection
+works over links.
+
 Trade-off: a program that draws its own clickable text over something matching
 a hyperlink rule no longer receives that click.

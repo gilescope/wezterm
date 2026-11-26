@@ -453,6 +453,8 @@ pub struct TermWindow {
     /// Tracks whether the current mouse-down event is part of click-focus.
     /// If so, we ignore mouse events until released
     is_click_to_focus_window: bool,
+    /// A left press on a link, taken from a mouse-grabbing program, is still held.
+    link_click_pending: bool,
     last_mouse_coords: (usize, i64),
     window_drag_position: Option<MouseEvent>,
     current_mouse_event: Option<MouseEvent>,
@@ -873,6 +875,7 @@ impl TermWindow {
             dragging: None,
             last_ui_item: None,
             is_click_to_focus_window: false,
+            link_click_pending: false,
             key_table_state: KeyTableState::default(),
             modal: RefCell::new(None),
             opengl_info: None,

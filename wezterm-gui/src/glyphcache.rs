@@ -1091,8 +1091,7 @@ impl GlyphCache {
         allow_image: AllowImage,
     ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
         let hash = image_data.hash();
-        // A sprite drawn with padding or scaled down is not the image's own size.
-        let full_size = padding.is_none() && allow_image == AllowImage::Yes;
+        let full_size = LiveImages::wanted(padding, allow_image);
         if full_size {
             if let Some(sprite) = self.live_images.sprite(image_data) {
                 return Ok((sprite, None, LoadState::Loaded));
@@ -1421,6 +1420,12 @@ struct LiveImage {
 }
 
 impl LiveImages {
+    /// Whether a sprite asked for this way can be a live one: not when it is
+    /// scaled down. Padding is blank space around a sprite and changes nothing.
+    fn wanted(_padding: Option<usize>, allow_image: AllowImage) -> bool {
+        allow_image == AllowImage::Yes
+    }
+
     /// Starts tracking `image` if it is a streamed picture shown at full size in `sprite`.
     fn track(&mut self, image: &Arc<ImageData>, sprite: &Sprite) {
         let frame = match &*image.data() {
@@ -1490,6 +1495,7 @@ impl LiveImage {
             _ => return false,
         };
         if frame != self.frame {
+            metrics::histogram!("glyph_cache.live_image.upload.rate").record(1.);
             self.sprite.texture.write(self.sprite.coords, &handle);
             self.frame = frame;
         }
@@ -1571,6 +1577,35 @@ mod live_image_test {
 
         assert_eq!(again.coords, sprite.coords);
         assert_eq!(f.shown(&sprite), 0x3333_3333);
+    }
+
+    /// The renderer always pads its image sprites; padding is blank space around
+    /// the sprite, so the sprite itself is still the picture's size.
+    #[test]
+    fn a_padded_sprite_is_tracked() {
+        let mut f = Fixture::new();
+        let image = Arc::new(ImageData::with_data(frame(0x11)));
+        let handle = DecodedImageHandle {
+            h: image.data(),
+            current_frame: 0,
+        };
+        let sprite = f
+            .atlas
+            .allocate_with_padding(&handle, Some(1), None)
+            .unwrap();
+        drop(handle);
+        assert!(LiveImages::wanted(Some(1), AllowImage::Yes));
+        f.live.track(&image, &sprite);
+
+        image.replace_streamed_frame(frame(0x44)).unwrap();
+        f.live.refresh();
+        assert_eq!(f.shown(&sprite), 0x4444_4444);
+    }
+
+    #[test]
+    fn a_scaled_down_or_refused_image_is_not_wanted() {
+        assert!(!LiveImages::wanted(Some(1), AllowImage::Scale(2)));
+        assert!(!LiveImages::wanted(None, AllowImage::No));
     }
 
     #[test]

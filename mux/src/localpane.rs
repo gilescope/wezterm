@@ -569,6 +569,13 @@ impl Pane for LocalPane {
         }
     }
 
+    fn pixel_wheel(&self, wheel: wezterm_term::PixelWheel) -> anyhow::Result<bool> {
+        if self.tmux_domain.lock().is_some() {
+            return Ok(false);
+        }
+        self.terminal.lock().pixel_wheel(wheel)
+    }
+
     fn is_alt_screen_active(&self) -> bool {
         if self.tmux_domain.lock().is_some() {
             false

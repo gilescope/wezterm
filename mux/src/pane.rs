@@ -340,6 +340,11 @@ pub trait Pane: Downcast + Send + Sync {
     /// In practice this controls whether the gui will perform local
     /// handling of clicks.
     fn is_mouse_grabbed(&self) -> bool;
+    /// Reports wheel movement in pixels, if the program in the pane asked for
+    /// that (`PIXEL_WHEEL_MODE`). False when it did not: send notches instead.
+    fn pixel_wheel(&self, _wheel: wezterm_term::PixelWheel) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     fn is_alt_screen_active(&self) -> bool;
 
     fn set_clipboard(&self, _clipboard: &Arc<dyn Clipboard>) {}

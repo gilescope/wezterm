@@ -62,8 +62,75 @@ impl super::TermWindow {
         }
     }
 
-    pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+    /// Gives trackpad movement, in pixels, to the pane under the pointer if its
+    /// program asked for that. False when it goes the ordinary way instead: over
+    /// the tab bar or another UI item, during a drag, with a modifier held (wheel
+    /// bindings and the mouse-reporting bypass key on those), or to a program
+    /// that only knows notches.
+    fn pixel_wheel_to_pane(&mut self, event: &MouseEvent) -> bool {
+        let WMEK::PixelWheel {
+            dx,
+            dy,
+            ticks_x,
+            ticks_y,
+        } = event.kind
+        else {
+            return false;
+        };
+        if event.modifiers != ::window::Modifiers::NONE
+            || self.current_mouse_capture.is_some()
+            || self.resolve_ui_item(event).is_some()
+        {
+            return false;
+        }
+
+        let border = self.get_os_border();
+        let (top_bar_height, _) = self.horizontal_bar_heights();
+        let (padding_left, padding_top) = self.padding_left_top();
+        let left =
+            self.left_bar_width() as isize + (padding_left + border.left.get() as f32) as isize;
+        let top = top_bar_height as isize + border.top.get() as isize + padding_top as isize;
+        let pointer = (event.coords.x - left, event.coords.y - top);
+        let cell = &self.render_metrics.cell_size;
+        // The device reports points (1/72 inch); the program draws in pixels.
+        let pixels = |hundredths: i32| hundredths as f32 / 100. * self.dimensions.dpi as f32 / 72.;
+
+        for pos in self.get_panes_to_render() {
+            let within = (pos.left, pos.top, pos.width, pos.height);
+            let Some((x, y)) = pixel_in_pane(pointer, (cell.width, cell.height), within) else {
+                continue;
+            };
+            let wheel = wezterm_term::PixelWheel {
+                x,
+                y,
+                dx: pixels(dx),
+                dy: pixels(dy),
+                ticks_x,
+                ticks_y,
+            };
+            return match pos.pane.pixel_wheel(wheel) {
+                Ok(taken) => taken,
+                Err(err) => {
+                    log::error!("pixel wheel report to pane {}: {err:#}", pos.pane.pane_id());
+                    false
+                }
+            };
+        }
+        false
+    }
+
+    pub fn mouse_event_impl(&mut self, mut event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        if matches!(event.kind, WMEK::PixelWheel { .. }) {
+            if self.pixel_wheel_to_pane(&event) {
+                return;
+            }
+            // Nobody asked for pixels: it is the wheel notches it completes, if any.
+            match event.kind.as_notches() {
+                Some(kind) => event.kind = kind,
+                None => return,
+            }
+        }
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -911,7 +978,7 @@ impl super::TermWindow {
                                 context.invalidate();
                             }
                         }
-                        WMEK::Release(_) | WMEK::HorzWheel(_) => {}
+                        WMEK::Release(_) | WMEK::HorzWheel(_) | WMEK::PixelWheel { .. } => {}
                         WMEK::VertWheel(_) => {
                             // Let wheel events route to the hovered pane,
                             // even if it doesn't have focus
@@ -1060,6 +1127,8 @@ impl super::TermWindow {
         }));
 
         let event_trigger_type = match &event.kind {
+            // `mouse_event_impl` turns these into notches before they get here.
+            WMEK::PixelWheel { .. } => return,
             WMEK::Press(press) => {
                 let press = mouse_press_to_tmb(press);
                 match self.last_mouse_click.as_ref() {
@@ -1224,6 +1293,7 @@ impl super::TermWindow {
                 WMEK::Move => TMEK::Move,
                 WMEK::VertWheel(_) | WMEK::HorzWheel(_) | WMEK::Press(_) => TMEK::Press,
                 WMEK::Release(_) => TMEK::Release,
+                WMEK::PixelWheel { .. } => return,
             },
             button: match event.kind {
                 WMEK::Release(ref press) | WMEK::Press(ref press) => mouse_press_to_tmb(press),
@@ -1252,6 +1322,7 @@ impl super::TermWindow {
                         TMB::WheelRight((-amount) as usize)
                     }
                 }
+                WMEK::PixelWheel { .. } => return,
             },
             x: column,
             y: row,
@@ -1367,5 +1438,45 @@ mod link_click_test {
             button: LEFT,
         };
         assert_eq!(link_click_takes(&double, false, true), (false, false));
+    }
+}
+
+/// Where `pointer` (pixels from the top left of the pane area) falls inside the
+/// pane at `(left, top, width, height)` cells of `cell` pixels each: pixels from
+/// that pane's top left. None when the pointer is outside it.
+fn pixel_in_pane(
+    pointer: (isize, isize),
+    cell: (isize, isize),
+    pane: (usize, usize, usize, usize),
+) -> Option<(usize, usize)> {
+    let (left, top, width, height) = pane;
+    let x = pointer.0 - left as isize * cell.0;
+    let y = pointer.1 - top as isize * cell.1;
+    let inside = x >= 0 && y >= 0 && x < width as isize * cell.0 && y < height as isize * cell.1;
+    inside.then(|| (x as usize, y as usize))
+}
+
+#[cfg(test)]
+mod pixel_in_pane_test {
+    use super::pixel_in_pane;
+
+    const CELL: (isize, isize) = (10, 20);
+    /// 30 columns by 5 rows, starting at column 40, row 2.
+    const PANE: (usize, usize, usize, usize) = (40, 2, 30, 5);
+
+    #[test]
+    fn a_pointer_in_the_pane_is_measured_from_its_corner() {
+        assert_eq!(pixel_in_pane((400, 40), CELL, PANE), Some((0, 0)));
+        assert_eq!(pixel_in_pane((455, 61), CELL, PANE), Some((55, 21)));
+        assert_eq!(pixel_in_pane((699, 139), CELL, PANE), Some((299, 99)));
+    }
+
+    #[test]
+    fn a_pointer_outside_the_pane_is_not_in_it() {
+        assert_eq!(pixel_in_pane((399, 40), CELL, PANE), None);
+        assert_eq!(pixel_in_pane((400, 39), CELL, PANE), None);
+        assert_eq!(pixel_in_pane((700, 40), CELL, PANE), None);
+        assert_eq!(pixel_in_pane((400, 140), CELL, PANE), None);
+        assert_eq!(pixel_in_pane((-5, -5), CELL, (0, 0, 30, 5)), None);
     }
 }

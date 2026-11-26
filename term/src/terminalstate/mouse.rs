@@ -73,6 +73,28 @@ impl TerminalState {
         (code, button)
     }
 
+    /// Reports `wheel` to the program if it asked for pixel wheel reports and is
+    /// taking the mouse. False when it did not: the caller reports notches instead.
+    pub fn pixel_wheel(&mut self, wheel: PixelWheel) -> anyhow::Result<bool> {
+        if !self.pixel_wheel_reports || !self.is_mouse_grabbed() {
+            return Ok(false);
+        }
+        let PixelWheel {
+            x,
+            y,
+            dx,
+            dy,
+            ticks_x,
+            ticks_y,
+        } = wheel;
+        write!(
+            self.writer,
+            "\x1b_pixel-wheel;{x};{y};{dx:.2};{dy:.2};{ticks_x};{ticks_y}\x1b\\"
+        )?;
+        self.writer.flush()?;
+        Ok(true)
+    }
+
     fn mouse_wheel(&mut self, event: MouseEvent) -> anyhow::Result<()> {
         let (button, _button) = self.mouse_report_button_number(&event);
 

@@ -1267,6 +1267,61 @@ pub enum MouseEventKind {
     Release(MousePress),
     VertWheel(i16),
     HorzWheel(i16),
+    /// Movement from a device that reports distance rather than notches (a
+    /// trackpad). `dx`/`dy` are hundredths of a point (1/72 inch), with the sign
+    /// of the notches. `ticks_x`/`ticks_y` are the notches the same movement
+    /// makes as `HorzWheel`/`VertWheel`: at most one is non-zero, and often
+    /// neither is, since most such events are smaller than a notch.
+    PixelWheel {
+        dx: i32,
+        dy: i32,
+        ticks_x: i16,
+        ticks_y: i16,
+    },
+}
+
+impl MouseEventKind {
+    /// What a `PixelWheel` is to a receiver that only knows notches: the wheel
+    /// event it stands for, or None when it is less than a notch.
+    pub fn as_notches(&self) -> Option<Self> {
+        match *self {
+            Self::PixelWheel { ticks_y, .. } if ticks_y != 0 => Some(Self::VertWheel(ticks_y)),
+            Self::PixelWheel { ticks_x, .. } if ticks_x != 0 => Some(Self::HorzWheel(ticks_x)),
+            Self::PixelWheel { .. } => None,
+            ref other => Some(other.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pixel_wheel_test {
+    use super::MouseEventKind as K;
+
+    fn wheel(ticks_x: i16, ticks_y: i16) -> K {
+        K::PixelWheel {
+            dx: 150,
+            dy: -275,
+            ticks_x,
+            ticks_y,
+        }
+    }
+
+    #[test]
+    fn a_pixel_wheel_stands_for_the_notches_it_carries() {
+        assert_eq!(wheel(0, -2).as_notches(), Some(K::VertWheel(-2)));
+        assert_eq!(wheel(3, 0).as_notches(), Some(K::HorzWheel(3)));
+    }
+
+    #[test]
+    fn less_than_a_notch_stands_for_nothing() {
+        assert_eq!(wheel(0, 0).as_notches(), None);
+    }
+
+    #[test]
+    fn other_events_stand_for_themselves() {
+        assert_eq!(K::Move.as_notches(), Some(K::Move));
+        assert_eq!(K::VertWheel(1).as_notches(), Some(K::VertWheel(1)));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

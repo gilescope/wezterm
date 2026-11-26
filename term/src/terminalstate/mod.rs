@@ -324,6 +324,8 @@ pub struct TerminalState {
 
     /// Movement events enabled
     any_event_mouse: bool,
+    /// `PIXEL_WHEEL_MODE`: wheel movement is reported in pixels.
+    pixel_wheel_reports: bool,
     focus_tracking: bool,
     /// X10 (legacy), SGR, and SGR-Pixels style mouse tracking and
     /// reporting is enabled
@@ -567,6 +569,7 @@ impl TerminalState {
             keyboard_encoding: KeyboardEncoding::Xterm,
             sixel_scrolls_right: false,
             any_event_mouse: false,
+            pixel_wheel_reports: false,
             button_event_mouse: false,
             mouse_tracking: false,
             last_mouse_move: None,
@@ -2177,6 +2180,13 @@ impl TerminalState {
             | Mode::ResetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::XTermAltSendsEscape,
             )) => {}
+
+            Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(PIXEL_WHEEL_MODE)) => {
+                self.pixel_wheel_reports = true;
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(PIXEL_WHEEL_MODE)) => {
+                self.pixel_wheel_reports = false;
+            }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(_))
             | Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(_))

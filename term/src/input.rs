@@ -96,3 +96,23 @@ impl LastMouseClick {
         }
     }
 }
+
+/// DEC private mode by which a program asks for wheel movement as pixel distances
+/// (`CSI ? 9278 h`), instead of one report per notch. Private to wezterm.
+pub const PIXEL_WHEEL_MODE: u16 = 9278;
+
+/// Wheel or trackpad movement in pixels, for a program that set `PIXEL_WHEEL_MODE`.
+/// It is reported as `APC pixel-wheel ; x ; y ; dx ; dy ; ticks_x ; ticks_y ST`.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct PixelWheel {
+    /// The pointer, in pixels from the top left of the pane.
+    pub x: usize,
+    pub y: usize,
+    /// Distance in pixels; positive is what a wheel-left or wheel-up notch reports.
+    pub dx: f32,
+    pub dy: f32,
+    /// The whole notches the same movement makes without this mode, so a program
+    /// can keep notch-counting behaviour (a swipe) alongside smooth scrolling.
+    pub ticks_x: i16,
+    pub ticks_y: i16,
+}

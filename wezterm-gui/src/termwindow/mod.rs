@@ -441,6 +441,8 @@ pub struct TermWindow {
     tab_bar_width_override: Option<f32>,
     /// Active matrix-rain tab-switch transition, if any.
     tab_switch_anim: Option<crate::termwindow::render::matrix_rain::TabSwitchAnim>,
+    /// Set by a link click; the tab switch it causes starts its rain there.
+    link_click: Option<crate::termwindow::render::matrix_rain::LinkClick>,
     /// When the tab last changed, to tell a scroll through tabs from one switch.
     last_tab_switch_at: Option<Instant>,
     /// Resume card shown over the active pane; see `matrix_rain.rs`.
@@ -798,6 +800,7 @@ impl TermWindow {
             tab_bar_scroll_offset: std::cell::Cell::new(0.),
             tab_bar_width_override: None,
             tab_switch_anim: None,
+            link_click: None,
             last_tab_switch_at: None,
             resume_card: None,
             matrix_rain_palette: None,
@@ -1387,6 +1390,7 @@ impl TermWindow {
                     self.mux_pane_output_event(pane_id);
                 }
                 MuxNotification::WindowInvalidated(_) => {
+                    self.rain_for_link_opened_tab();
                     window.invalidate();
                     self.update_title_post_status();
                 }
@@ -3591,7 +3595,28 @@ impl TermWindow {
         self.emit_window_event("search-item-picked", None);
     }
 
-    fn do_open_link_at_mouse_cursor(&self, pane: &Arc<dyn Pane>) {
+    /// A link click's handler (the `open-uri` event) may switch tab from Lua,
+    /// which the window only hears of as an invalidation. Treat that switch
+    /// like any other: rain, focus, `tab-activated`.
+    fn rain_for_link_opened_tab(&mut self) {
+        use crate::termwindow::render::matrix_rain::click_is_fresh;
+        let Some(click) = self.link_click.as_ref() else {
+            return;
+        };
+        if !click_is_fresh(click.at, Instant::now()) {
+            self.link_click = None;
+            return;
+        }
+        let active = Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .map(|tab| tab.tab_id());
+        if active.is_some() && active != Some(click.tab_id) {
+            let prev_pane = Some(Arc::clone(&click.pane));
+            self.after_tab_activated(prev_pane, true);
+        }
+    }
+
+    fn do_open_link_at_mouse_cursor(&mut self, pane: &Arc<dyn Pane>) {
         // They clicked on a link, so let's open it!
         // We need to ensure that we spawn the `open` call outside of the context
         // of our window loop; on Windows it can cause a panic due to
@@ -3604,6 +3629,19 @@ impl TermWindow {
             // next mouse move restores the pointer.
             if let Some(w) = self.window.as_ref() {
                 w.set_cursor(Some(CursorIcon::Progress));
+            }
+            if let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) {
+                let pane_left = self
+                    .get_panes_to_render()
+                    .iter()
+                    .find(|p| p.pane.pane_id() == pane.pane_id())
+                    .map_or(0, |p| p.left);
+                self.link_click = Some(crate::termwindow::render::matrix_rain::LinkClick {
+                    at: Instant::now(),
+                    col: self.last_mouse_coords.0.saturating_sub(pane_left),
+                    tab_id: tab.tab_id(),
+                    pane: Arc::clone(pane),
+                });
             }
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());

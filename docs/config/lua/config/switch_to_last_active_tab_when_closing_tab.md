@@ -11,3 +11,6 @@ will be activated.
 
 Otherwise, the tab to the left of the active tab will be activated.
 
+In this fork the tab history comes first: closing the active tab goes back to
+the most recent tab in the history that still exists. This option only decides
+what happens when the history has nowhere to go back to.

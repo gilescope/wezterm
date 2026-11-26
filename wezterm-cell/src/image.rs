@@ -653,4 +653,33 @@ impl ImageData {
     pub fn hash(&self) -> [u8; 32] {
         self.hash
     }
+
+    /// Swaps in the next frame of a streamed picture (`new_single_frame_streamed`)
+    /// when it has the same size as the pixels held now, so that the cells showing
+    /// this image keep it. `hash()` stays as it was: it names the image; the hash
+    /// inside the data names the frame. Hands the frame back when it does not fit.
+    pub fn replace_streamed_frame(&self, frame: ImageDataType) -> Result<(), ImageDataType> {
+        let mut held = self.data();
+        match (&*held, &frame) {
+            (
+                ImageDataType::Rgba8 { width, height, .. },
+                ImageDataType::Rgba8 {
+                    width: new_width,
+                    height: new_height,
+                    data,
+                    ..
+                },
+            ) if width == new_width
+                && height == new_height
+                && data.len() >= ImageDataType::STREAMED_FRAME_BYTES =>
+            {
+                *held = frame;
+                Ok(())
+            }
+            _ => {
+                drop(held);
+                Err(frame)
+            }
+        }
+    }
 }

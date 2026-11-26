@@ -16,6 +16,7 @@ use wezterm_escape_parser::apc::{
     KittyImageTransmit, KittyImageVerbosity,
 };
 use wezterm_surface::change::ImageData;
+use wezterm_surface::SequenceNo;
 
 #[derive(Debug, Default)]
 pub struct KittyImageState {
@@ -24,7 +25,18 @@ pub struct KittyImageState {
     number_to_id: HashMap<u32, u32>,
     id_to_data: HashMap<u32, Arc<ImageData>>,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
+    /// How each placement was asked for, to recognise the same request again.
+    placed_as: HashMap<(u32, Option<u32>), PlacedAs>,
     used_memory: usize,
+}
+
+/// What a placement request looked like and when it was carried out.
+#[derive(Debug)]
+struct PlacedAs {
+    placement: KittyImagePlacement,
+    cursor_x: usize,
+    /// Lines changed after this have lost, or may have lost, part of the picture.
+    seqno: SequenceNo,
 }
 
 impl KittyImageState {
@@ -103,6 +115,7 @@ impl TerminalState {
         if image_id != 0 {
             self.kitty_remove_placement(image_id, placement.placement_id);
         }
+        let cursor_x = self.cursor.x;
         let img = Arc::clone(self.kitty_img.id_to_data.get(&image_id).ok_or_else(|| {
             anyhow::anyhow!(
                 "no matching image id {} in id_to_data for image_number {:?}",
@@ -132,14 +145,19 @@ impl TerminalState {
             do_not_move_cursor: placement.do_not_move_cursor,
         })?;
 
-        self.kitty_img
-            .placements
-            .insert((image_id, placement.placement_id), info);
+        let key = (image_id, placement.placement_id);
+        self.kitty_img.placements.insert(key, info);
+        let placed_as = PlacedAs {
+            placement,
+            cursor_x,
+            seqno: self.seqno,
+        };
+        self.kitty_img.placed_as.insert(key, placed_as);
         log::trace!(
             "record placement for {} (image_number {:?}) {:?}",
             image_id,
             image_number,
-            placement.placement_id
+            key.1
         );
 
         Ok(())
@@ -163,8 +181,21 @@ impl TerminalState {
                 verbosity,
             } => {
                 log::trace!("TransmitDataAndDisplay {:#?} {:#?}", transmit, placement);
-                let image_number = transmit.image_number;
-                let image_id = self.kitty_img_transmit(transmit, verbosity)?;
+                let named_by_id = transmit.image_id.is_some();
+                let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
+                let img = match self.kitty_img_next_frame_in_place(image_id, &placement, img) {
+                    Ok(()) => {
+                        self.kitty_acknowledge_transmit(
+                            named_by_id,
+                            image_id,
+                            image_number,
+                            verbosity,
+                        );
+                        return Ok(());
+                    }
+                    Err(img) => img,
+                };
+                self.kitty_img_store(named_by_id, image_id, image_number, img, verbosity)?;
                 self.kitty_img_place(Some(image_id), image_number, placement, verbosity)
             }
             _ => anyhow::bail!("impossible KittImage variant"),
@@ -311,6 +342,7 @@ impl TerminalState {
 
     fn kitty_remove_placement(&mut self, image_id: u32, placement_id: Option<u32>) {
         if placement_id.is_some() {
+            self.kitty_img.placed_as.remove(&(image_id, placement_id));
             if let Some(info) = self.kitty_img.placements.remove(&(image_id, placement_id)) {
                 log::trace!("removed placement {} {:?}", image_id, placement_id);
                 self.kitty_remove_placement_from_model(image_id, placement_id, info);
@@ -323,6 +355,7 @@ impl TerminalState {
                 }
             }
             for p in to_clear.into_iter() {
+                self.kitty_img.placed_as.remove(&(image_id, p));
                 if let Some(info) = self.kitty_img.placements.remove(&(image_id, p)) {
                     self.kitty_remove_placement_from_model(image_id, p, info);
                 }
@@ -338,6 +371,7 @@ impl TerminalState {
     }
 
     pub(crate) fn kitty_remove_all_placements(&mut self, delete: bool) {
+        self.kitty_img.placed_as.clear();
         for ((image_id, p), info) in std::mem::take(&mut self.kitty_img.placements).into_iter() {
             self.kitty_remove_placement_from_model(image_id, p, info);
         }
@@ -852,16 +886,38 @@ impl TerminalState {
         transmit: KittyImageTransmit,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<u32> {
-        // The client named the image with i= (or I=): that is who a reply is for.
         let named_by_id = transmit.image_id.is_some();
         let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
+        self.kitty_img_store(named_by_id, image_id, image_number, img, verbosity)?;
+        Ok(image_id)
+    }
+
+    fn kitty_img_store(
+        &mut self,
+        named_by_id: bool,
+        image_id: u32,
+        image_number: Option<u32>,
+        img: ImageDataType,
+        verbosity: KittyImageVerbosity,
+    ) -> anyhow::Result<()> {
         self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
 
         let img = self
             .raw_image_to_image_data(img)
             .context("storing image data")?;
         self.kitty_img.record_id_to_data(image_id, img);
+        self.kitty_acknowledge_transmit(named_by_id, image_id, image_number, verbosity);
+        Ok(())
+    }
 
+    /// The client named the image with i= (or I=): that is who a reply is for.
+    fn kitty_acknowledge_transmit(
+        &mut self,
+        named_by_id: bool,
+        image_id: u32,
+        image_number: Option<u32>,
+        verbosity: KittyImageVerbosity,
+    ) {
         if named_by_id || image_number.is_some() {
             self.kitty_send_response(
                 verbosity,
@@ -871,8 +927,67 @@ impl TerminalState {
                 "OK".to_string(),
             );
         }
+    }
 
-        Ok(image_id)
+    /// The next frame of a picture a program is streaming: the same image id, the
+    /// same size, asked to go exactly where it already is, with nothing written
+    /// over it since. Then only the pixels change, and the cells keep the image
+    /// they have. Placing it afresh would touch every cell under the picture and
+    /// make every one of its lines look changed, on every frame.
+    /// Hands `img` back when any of that does not hold.
+    fn kitty_img_next_frame_in_place(
+        &mut self,
+        image_id: u32,
+        placement: &KittyImagePlacement,
+        img: ImageDataType,
+    ) -> Result<(), ImageDataType> {
+        let key = (image_id, placement.placement_id);
+        let cursor_x = self.cursor.x;
+        let cursor_row = self.screen().visible_row_to_stable_row(self.cursor.y);
+        let (Some(info), Some(placed_as), Some(held)) = (
+            self.kitty_img.placements.get(&key),
+            self.kitty_img.placed_as.get(&key),
+            self.kitty_img.id_to_data.get(&image_id),
+        ) else {
+            return Err(img);
+        };
+        // A placement that moves the cursor is not repeated by drawing nothing.
+        let same_request = image_id != 0
+            && placement.do_not_move_cursor
+            && placed_as.placement == *placement
+            && placed_as.cursor_x == cursor_x
+            && info.first_row == cursor_row;
+        if !same_request {
+            return Err(img);
+        }
+
+        let screen = self.screen();
+        let rows = info.first_row..info.first_row + info.rows as StableRowIndex;
+        let range = screen.stable_range(&rows);
+        let untouched = range.len() == info.rows
+            && range
+                .clone()
+                .all(|idx| screen.line(idx).current_seqno() <= placed_as.seqno);
+        // The other screen (alternate or primary) can hold old lines at these rows.
+        let shows_it = untouched
+            && screen
+                .line(range.start)
+                .get_cell(cursor_x)
+                .and_then(|cell| cell.attrs().images())
+                .map_or(false, |images| {
+                    images.iter().any(|im| {
+                        im.image_id() == Some(image_id) && Arc::ptr_eq(im.image_data(), held)
+                    })
+                });
+        if !shows_it {
+            return Err(img);
+        }
+
+        let before = held.len();
+        held.replace_streamed_frame(img)?;
+        let after = held.len();
+        self.kitty_img.used_memory = self.kitty_img.used_memory.saturating_sub(before) + after;
+        Ok(())
     }
 
     fn coalesce_kitty_accumulation(&mut self, img: KittyImage) -> anyhow::Result<KittyImage> {

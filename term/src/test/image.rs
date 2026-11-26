@@ -284,3 +284,111 @@ fn kitty_streamed_frames_are_not_content_hashed() {
 fn kitty_small_images_are_still_content_hashed() {
     std::assert_eq!(hash_after_transmitting(64), hash_after_transmitting(64));
 }
+
+/// A 512x512 RGBA frame of one repeated byte: exactly `STREAMED_FRAME_BYTES`, so
+/// it is treated as a streamed frame. `sextet` is the base64 digit for the byte.
+fn big_frame(sextet: char, id: u32) -> String {
+    let body: String = std::iter::repeat(sextet).take(4 * 349_525).collect();
+    let tail = if sextet == 'A' { "AA==" } else { "/w==" };
+    // C=1: the cursor stays put, as a program redrawing one picture asks for.
+    format!("\x1b[H\x1b_Ga=T,t=d,f=32,s=512,v=512,i={id},q=2,C=1;{body}{tail}\x1b\\")
+}
+
+fn first_pixel(image: &Arc<ImageData>) -> u8 {
+    match &*image.data() {
+        ImageDataType::Rgba8 { data, .. } => data[0],
+        other => panic!("expected Rgba8, got {:?}", other),
+    }
+}
+
+fn row_seqnos(term: &TestTerm) -> Vec<SequenceNo> {
+    let lines = term.screen().visible_lines();
+    lines.iter().map(|line| line.current_seqno()).collect()
+}
+
+/// A program that streams a picture (a browser in a pane) sends the whole frame
+/// again under the same image id, in the same place. That must swap the pixels of
+/// the image already on screen, not attach a new image to every cell: re-attaching
+/// dirties every line under the picture on every frame.
+#[test]
+fn kitty_streamed_frame_sent_again_swaps_pixels_in_place() {
+    let mut term = TestTerm::new(34, 70, 0);
+    term.advance_bytes(big_frame('A', 7).as_bytes());
+    let before = first_image(&term);
+    k9::assert_equal!(first_pixel(&before), 0x00);
+    let hash_before = before.data().compute_hash();
+    let seqnos = row_seqnos(&term);
+
+    term.advance_bytes(big_frame('/', 7).as_bytes());
+    let after = first_image(&term);
+
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "the image was replaced, not updated in place"
+    );
+    k9::assert_equal!(first_pixel(&after), 0xff);
+    assert_ne!(
+        after.data().compute_hash(),
+        hash_before,
+        "the renderer could not tell the pixels changed"
+    );
+    k9::assert_equal!(row_seqnos(&term), seqnos);
+}
+
+/// Text written over the picture since the last frame must be painted over by the
+/// next one, which the in-place path cannot do.
+#[test]
+fn kitty_streamed_frame_after_text_over_the_picture_is_placed_afresh() {
+    let mut term = TestTerm::new(34, 70, 0);
+    term.advance_bytes(big_frame('A', 7).as_bytes());
+    let before = first_image(&term);
+
+    term.advance_bytes(b"\x1b[3;3Hx\x1b[3;3H\x1b[K");
+    term.advance_bytes(big_frame('/', 7).as_bytes());
+
+    let after = first_image(&term);
+    assert!(!Arc::ptr_eq(&before, &after));
+    let erased = term.screen().visible_lines()[2]
+        .get_cell(40)
+        .unwrap()
+        .attrs()
+        .images();
+    assert!(
+        erased.is_some(),
+        "the erased part of the picture was not painted again"
+    );
+}
+
+/// A frame of another size, or placed somewhere else, is a new placement.
+#[test]
+fn kitty_streamed_frame_elsewhere_is_placed_afresh() {
+    let mut term = TestTerm::new(34, 70, 0);
+    term.advance_bytes(big_frame('A', 7).as_bytes());
+    let before = first_image(&term);
+
+    let moved = big_frame('/', 7).replacen("\x1b[H", "\x1b[1;3H", 1);
+    term.advance_bytes(moved.as_bytes());
+
+    let lines = term.screen().visible_lines();
+    assert!(lines[0].get_cell(0).unwrap().attrs().images().is_none());
+    let image = lines[0].get_cell(2).unwrap().attrs().images().unwrap();
+    assert!(!Arc::ptr_eq(&before, image[0].image_data()));
+}
+
+/// A second image id drawn in the same place is a different image.
+#[test]
+fn kitty_streamed_frame_under_another_id_is_placed_afresh() {
+    let mut term = TestTerm::new(34, 70, 0);
+    term.advance_bytes(big_frame('A', 7).as_bytes());
+    let before = first_image(&term);
+    term.advance_bytes(big_frame('/', 8).as_bytes());
+    k9::assert_equal!(first_pixel(&before), 0x00);
+}
+
+/// The in-place path answers a verbose transmit exactly as the full path does.
+#[test]
+fn kitty_streamed_frame_in_place_is_acknowledged() {
+    let frame = big_frame('A', 7).replace(",q=2", "");
+    let twice = format!("{frame}{frame}");
+    k9::assert_equal!(answer_to(&twice), "\x1b_Gi=7;OK\x1b\\\x1b_Gi=7;OK\x1b\\");
+}

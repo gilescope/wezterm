@@ -49,7 +49,7 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::{is_ascii_control, IntegratedTitleButtonStyle, KeyboardLedStatus};
 
@@ -98,6 +98,49 @@ fn round_away_from_zero(value: f64) -> i16 {
         value.max(1.).round() as i16
     } else {
         value.min(-1.).round() as i16
+    }
+}
+
+/// How long to hold off the next paint so that paints *start* `1 / max_fps` apart.
+/// `painting` is how long the paint just finished took: without subtracting it a
+/// 7ms paint at 60fps repeats every 23ms, which is 43fps.
+fn paint_throttle_delay(max_fps: u64, painting: Duration) -> Duration {
+    (Duration::from_secs(1) / max_fps.clamp(1, 1000) as u32).saturating_sub(painting)
+}
+
+#[cfg(test)]
+mod paint_throttle_test {
+    use super::*;
+
+    #[test]
+    fn paint_time_counts_towards_the_frame_interval() {
+        let interval = Duration::from_secs(1) / 60;
+        let painting = Duration::from_millis(7);
+        assert_eq!(paint_throttle_delay(60, painting), interval - painting);
+    }
+
+    #[test]
+    fn an_instant_paint_waits_the_whole_interval() {
+        assert_eq!(
+            paint_throttle_delay(120, Duration::ZERO),
+            Duration::from_secs(1) / 120
+        );
+    }
+
+    #[test]
+    fn a_paint_longer_than_the_interval_does_not_wait() {
+        assert_eq!(
+            paint_throttle_delay(60, Duration::from_millis(40)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn max_fps_of_zero_does_not_divide_by_zero() {
+        assert_eq!(
+            paint_throttle_delay(0, Duration::ZERO),
+            Duration::from_secs(1)
+        );
     }
 }
 
@@ -3160,15 +3203,15 @@ impl WindowView {
             if inner.paint_throttled {
                 inner.invalidated = true;
             } else {
+                let paint_started = Instant::now();
                 inner.events.dispatch(WindowEvent::NeedRepaint);
                 inner.invalidated = false;
                 inner.paint_throttled = true;
 
                 let window_id = inner.window_id;
-                let max_fps = inner.config.max_fps;
+                let delay = paint_throttle_delay(inner.config.max_fps, paint_started.elapsed());
                 promise::spawn::spawn(async move {
-                    async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64))
-                        .await;
+                    async_io::Timer::after(delay).await;
                     Connection::with_window_inner(window_id, move |inner| {
                         if let Some(window_view) = WindowView::get_this(unsafe { &**inner.view }) {
                             let mut state = window_view.inner.borrow_mut();

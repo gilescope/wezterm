@@ -568,6 +568,7 @@ pub struct GlyphCache {
     pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
     min_frame_duration: Duration,
+    live_images: LiveImages,
 }
 
 impl GlyphCache {
@@ -591,6 +592,7 @@ impl GlyphCache {
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
+            live_images: LiveImages::default(),
         })
     }
 }
@@ -620,6 +622,7 @@ impl GlyphCache {
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
+            live_images: LiveImages::default(),
         })
     }
 }
@@ -1088,7 +1091,31 @@ impl GlyphCache {
         allow_image: AllowImage,
     ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
         let hash = image_data.hash();
+        let full_size = LiveImages::wanted(padding, allow_image);
+        if full_size {
+            if let Some(sprite) = self.live_images.sprite(image_data) {
+                return Ok((sprite, None, LoadState::Loaded));
+            }
+        }
+        let res = self.cached_image_uncached(image_data, hash, padding, allow_image)?;
+        if full_size {
+            self.live_images.track(image_data, &res.0);
+        }
+        Ok(res)
+    }
 
+    /// Uploads the frames that streamed pictures received since the last paint.
+    pub fn refresh_live_images(&mut self) {
+        self.live_images.refresh();
+    }
+
+    fn cached_image_uncached(
+        &mut self,
+        image_data: &Arc<ImageData>,
+        hash: [u8; 32],
+        padding: Option<usize>,
+        allow_image: AllowImage,
+    ) -> anyhow::Result<(Sprite, Option<Instant>, LoadState)> {
         if let Some(decoded) = self.image_cache.get(&hash) {
             Self::cached_image_impl(
                 &mut self.frame_cache,
@@ -1372,5 +1399,233 @@ impl GlyphCache {
         }
 
         self.line_sprite(key, metrics)
+    }
+}
+
+/// Sprites of pictures whose pixels are swapped in place: a program streaming
+/// frames into a pane (`ImageData::replace_streamed_frame`). Such an image keeps
+/// its place in the atlas and each new frame is uploaded over the last one. Giving
+/// every frame its own sprite fills the atlas several times a second, and each
+/// time it fills every glyph is thrown away with it.
+#[derive(Default)]
+struct LiveImages {
+    by_image: HashMap<[u8; 32], LiveImage>,
+}
+
+struct LiveImage {
+    image: std::sync::Weak<ImageData>,
+    /// The frame the sprite shows.
+    frame: [u8; 32],
+    sprite: Sprite,
+}
+
+impl LiveImages {
+    /// Whether a sprite asked for this way can be a live one: not when it is
+    /// scaled down. Padding is blank space around a sprite and changes nothing.
+    fn wanted(_padding: Option<usize>, allow_image: AllowImage) -> bool {
+        allow_image == AllowImage::Yes
+    }
+
+    /// Starts tracking `image` if it is a streamed picture shown at full size in `sprite`.
+    fn track(&mut self, image: &Arc<ImageData>, sprite: &Sprite) {
+        let frame = match &*image.data() {
+            ImageDataType::Rgba8 {
+                width,
+                height,
+                data,
+                hash,
+            } if data.len() >= ImageDataType::STREAMED_FRAME_BYTES
+                && sprite.coords.size.width == *width as isize
+                && sprite.coords.size.height == *height as isize =>
+            {
+                *hash
+            }
+            _ => return,
+        };
+        let live = LiveImage {
+            image: Arc::downgrade(image),
+            frame,
+            sprite: sprite.clone(),
+        };
+        self.by_image.insert(image.hash(), live);
+    }
+
+    /// The sprite for `image`, brought up to its current frame. None if it is not
+    /// tracked, or its pixels no longer fit the sprite.
+    fn sprite(&mut self, image: &Arc<ImageData>) -> Option<Sprite> {
+        let key = image.hash();
+        let live = self.by_image.get_mut(&key)?;
+        if live.show_current_frame(image) {
+            Some(live.sprite.clone())
+        } else {
+            self.by_image.remove(&key);
+            None
+        }
+    }
+
+    /// Uploads the frames that arrived since the last paint. Lines drawn from
+    /// cached quads never ask for their sprite again, so paint calls this once.
+    fn refresh(&mut self) {
+        self.by_image.retain(|_, live| match live.image.upgrade() {
+            Some(image) => live.show_current_frame(&image),
+            None => false,
+        });
+    }
+}
+
+impl LiveImage {
+    /// Uploads the image's frame if the sprite shows an older one. False when the
+    /// pixels are no longer a frame of the sprite's size.
+    fn show_current_frame(&mut self, image: &ImageData) -> bool {
+        let handle = DecodedImageHandle {
+            h: image.data(),
+            current_frame: 0,
+        };
+        let frame = match &*handle.h {
+            ImageDataType::Rgba8 {
+                width,
+                height,
+                hash,
+                ..
+            } if self.sprite.coords.size.width == *width as isize
+                && self.sprite.coords.size.height == *height as isize =>
+            {
+                *hash
+            }
+            _ => return false,
+        };
+        if frame != self.frame {
+            metrics::histogram!("glyph_cache.live_image.upload.rate").record(1.);
+            self.sprite.texture.write(self.sprite.coords, &handle);
+            self.frame = frame;
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod live_image_test {
+    use super::*;
+
+    const SIDE: u32 = 512;
+
+    fn frame(byte: u8) -> ImageDataType {
+        let data = vec![byte; (SIDE * SIDE * 4) as usize];
+        ImageDataType::new_single_frame_streamed(SIDE, SIDE, data)
+    }
+
+    struct Fixture {
+        texture: Rc<ImageTexture>,
+        atlas: Atlas,
+        live: LiveImages,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let texture = Rc::new(ImageTexture::new(2048, 2048));
+            let surface: Rc<dyn Texture2d> = texture.clone();
+            Self {
+                atlas: Atlas::new(&surface).unwrap(),
+                texture,
+                live: LiveImages::default(),
+            }
+        }
+
+        /// Draws `image` into the atlas as the uncached path does.
+        fn draw(&mut self, image: &Arc<ImageData>) -> Sprite {
+            let handle = DecodedImageHandle {
+                h: image.data(),
+                current_frame: 0,
+            };
+            self.atlas
+                .allocate_with_padding(&handle, None, None)
+                .unwrap()
+        }
+
+        fn shown(&self, sprite: &Sprite) -> u32 {
+            let (x, y) = (
+                sprite.coords.min_x() as usize,
+                sprite.coords.min_y() as usize,
+            );
+            *self.texture.image.borrow().pixel(x + 5, y + 5)
+        }
+    }
+
+    #[test]
+    fn a_new_frame_is_uploaded_over_the_last_one() {
+        let mut f = Fixture::new();
+        let image = Arc::new(ImageData::with_data(frame(0x11)));
+        let sprite = f.draw(&image);
+        f.live.track(&image, &sprite);
+        assert_eq!(f.shown(&sprite), 0x1111_1111);
+
+        image.replace_streamed_frame(frame(0x22)).unwrap();
+        f.live.refresh();
+
+        assert_eq!(f.shown(&sprite), 0x2222_2222);
+    }
+
+    #[test]
+    fn asking_for_the_sprite_brings_it_up_to_date_and_keeps_its_place() {
+        let mut f = Fixture::new();
+        let image = Arc::new(ImageData::with_data(frame(0x11)));
+        let sprite = f.draw(&image);
+        f.live.track(&image, &sprite);
+
+        image.replace_streamed_frame(frame(0x33)).unwrap();
+        let again = f.live.sprite(&image).expect("a tracked image has a sprite");
+
+        assert_eq!(again.coords, sprite.coords);
+        assert_eq!(f.shown(&sprite), 0x3333_3333);
+    }
+
+    /// The renderer always pads its image sprites; padding is blank space around
+    /// the sprite, so the sprite itself is still the picture's size.
+    #[test]
+    fn a_padded_sprite_is_tracked() {
+        let mut f = Fixture::new();
+        let image = Arc::new(ImageData::with_data(frame(0x11)));
+        let handle = DecodedImageHandle {
+            h: image.data(),
+            current_frame: 0,
+        };
+        let sprite = f
+            .atlas
+            .allocate_with_padding(&handle, Some(1), None)
+            .unwrap();
+        drop(handle);
+        assert!(LiveImages::wanted(Some(1), AllowImage::Yes));
+        f.live.track(&image, &sprite);
+
+        image.replace_streamed_frame(frame(0x44)).unwrap();
+        f.live.refresh();
+        assert_eq!(f.shown(&sprite), 0x4444_4444);
+    }
+
+    #[test]
+    fn a_scaled_down_or_refused_image_is_not_wanted() {
+        assert!(!LiveImages::wanted(Some(1), AllowImage::Scale(2)));
+        assert!(!LiveImages::wanted(None, AllowImage::No));
+    }
+
+    #[test]
+    fn a_small_image_is_not_tracked() {
+        let mut f = Fixture::new();
+        let small = ImageDataType::new_single_frame(2, 2, vec![0x11; 16]);
+        let image = Arc::new(ImageData::with_data(small));
+        let sprite = f.draw(&image);
+        f.live.track(&image, &sprite);
+        assert!(f.live.sprite(&image).is_none());
+    }
+
+    #[test]
+    fn an_image_that_is_gone_is_forgotten() {
+        let mut f = Fixture::new();
+        let image = Arc::new(ImageData::with_data(frame(0x11)));
+        let sprite = f.draw(&image);
+        f.live.track(&image, &sprite);
+        drop(image);
+        f.live.refresh();
+        assert!(f.live.by_image.is_empty());
     }
 }

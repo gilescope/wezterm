@@ -326,6 +326,12 @@ impl Screen {
         }
     }
 
+    /// Get a reference to a line, relative to start of scrollback.
+    #[inline]
+    pub fn line(&self, idx: PhysRowIndex) -> &Line {
+        &self.lines[idx]
+    }
+
     /// Get mutable reference to a line, relative to start of scrollback.
     #[inline]
     pub fn line_mut(&mut self, idx: PhysRowIndex) -> &mut Line {

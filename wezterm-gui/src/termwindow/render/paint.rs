@@ -34,6 +34,10 @@ impl crate::TermWindow {
             }
         }
 
+        if let Some(render_state) = self.render_state.as_ref() {
+            render_state.glyph_cache.borrow_mut().refresh_live_images();
+        }
+
         'pass: for pass in 0.. {
             match self.paint_pass() {
                 Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {

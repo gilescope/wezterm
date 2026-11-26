@@ -101,6 +101,88 @@ fn round_away_from_zero(value: f64) -> i16 {
     }
 }
 
+/// The event for one scroll of the wheel or trackpad. `points` is the distance the
+/// device reported and `notches` the whole notches it comes to once the
+/// remainder of earlier movement is added in. A device with precise deltas
+/// reports every movement, since most are smaller than a notch; a notched wheel
+/// reports only whole notches, as before.
+fn wheel_event(precise: bool, points: (f64, f64), notches: (f64, f64)) -> Option<MouseEventKind> {
+    let (horz, vert) = notches;
+    let notch = if vert.abs() < 1.0 && horz.abs() < 1.0 {
+        None
+    } else if vert.abs() > horz.abs() {
+        Some(MouseEventKind::VertWheel(round_away_from_zero(vert)))
+    } else {
+        Some(MouseEventKind::HorzWheel(round_away_from_zero(horz)))
+    };
+    if !precise {
+        return notch;
+    }
+    let hundredths = |points: f64| (points * 100.).round() as i32;
+    let (dx, dy) = (hundredths(points.0), hundredths(points.1));
+    if dx == 0 && dy == 0 && notch.is_none() {
+        return None;
+    }
+    Some(MouseEventKind::PixelWheel {
+        dx,
+        dy,
+        ticks_x: match notch {
+            Some(MouseEventKind::HorzWheel(n)) => n,
+            _ => 0,
+        },
+        ticks_y: match notch {
+            Some(MouseEventKind::VertWheel(n)) => n,
+            _ => 0,
+        },
+    })
+}
+
+#[cfg(test)]
+mod wheel_event_test {
+    use super::*;
+    use MouseEventKind as K;
+
+    #[test]
+    fn a_notched_wheel_reports_whole_notches_only() {
+        assert_eq!(
+            wheel_event(false, (0., 1.), (0., 1.)),
+            Some(K::VertWheel(1))
+        );
+        assert_eq!(
+            wheel_event(false, (-2., 0.), (-2., 0.)),
+            Some(K::HorzWheel(-2))
+        );
+        assert_eq!(wheel_event(false, (0., 0.4), (0., 0.4)), None);
+    }
+
+    #[test]
+    fn a_trackpad_reports_movement_smaller_than_a_notch() {
+        let expected = K::PixelWheel {
+            dx: 0,
+            dy: -350,
+            ticks_x: 0,
+            ticks_y: 0,
+        };
+        assert_eq!(wheel_event(true, (0., -3.5), (0., 0.)), Some(expected));
+    }
+
+    #[test]
+    fn a_trackpad_report_carries_the_notches_it_completes() {
+        let expected = K::PixelWheel {
+            dx: 100,
+            dy: 3000,
+            ticks_x: 0,
+            ticks_y: 2,
+        };
+        assert_eq!(wheel_event(true, (1., 30.), (0., 2.)), Some(expected));
+    }
+
+    #[test]
+    fn a_trackpad_event_with_no_movement_reports_nothing() {
+        assert_eq!(wheel_event(true, (0., 0.), (0., 0.)), None);
+    }
+}
+
 /// How long to hold off the next paint so that paints *start* `1 / max_fps` apart.
 /// `painting` is how long the paint just finished took: without subtracting it a
 /// 7ms paint at 60fps repeats every 23ms, which is 43fps.
@@ -2525,8 +2607,10 @@ impl WindowView {
             // so we want to report those lines here wholesale.
             1.0
         };
-        let mut vert_delta = unsafe { nsevent.scrollingDeltaY() } / scale;
-        let mut horz_delta = unsafe { nsevent.scrollingDeltaX() } / scale;
+        let points_y = unsafe { nsevent.scrollingDeltaY() };
+        let points_x = unsafe { nsevent.scrollingDeltaX() };
+        let mut vert_delta = points_y / scale;
+        let mut horz_delta = points_x / scale;
 
         if let Some(myself) = Self::get_this(this) {
             let mut inner = myself.inner.borrow_mut();
@@ -2569,16 +2653,14 @@ impl WindowView {
             horz_delta = horz_delta.trunc();
         }
 
-        if vert_delta.abs() < 1.0 && horz_delta.abs() < 1.0 {
-            return;
+        let kind = wheel_event(
+            has_precise_deltas,
+            (points_x, points_y),
+            (horz_delta, vert_delta),
+        );
+        if let Some(kind) = kind {
+            Self::mouse_common(this, nsevent, kind);
         }
-
-        let kind = if vert_delta.abs() > horz_delta.abs() {
-            MouseEventKind::VertWheel(round_away_from_zero(vert_delta))
-        } else {
-            MouseEventKind::HorzWheel(round_away_from_zero(horz_delta))
-        };
-        Self::mouse_common(this, nsevent, kind);
     }
 
     extern "C" fn right_mouse_down(this: &mut Object, _sel: Sel, nsevent: id) {
